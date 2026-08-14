@@ -32,7 +32,8 @@ public final class MainActivityTest extends ActivityInstrumentationTestCase2<Mai
         assertTrue(containsText(activity.findViewById(android.R.id.content), "终端"));
         assertTrue(containsText(activity.findViewById(android.R.id.content), "Agent 循环"));
         clickText(activity, "插件列表");
-        assertTrue(containsText(activity.findViewById(android.R.id.content), "插件列表  136"));
+        assertTrue(containsText(activity.findViewById(android.R.id.content), "原生可用 20"));
+        assertTrue(containsText(activity.findViewById(android.R.id.content), "显示全部兼容标识"));
 
         clickText(activity, "Agent 预设");
         assertTrue(containsText(activity.findViewById(android.R.id.content), "标准模式"));

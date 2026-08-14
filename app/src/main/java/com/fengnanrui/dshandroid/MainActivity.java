@@ -9,6 +9,8 @@ import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.text.InputType;
 import android.text.Editable;
 import android.text.TextWatcher;
@@ -68,6 +70,8 @@ public final class MainActivity extends Activity {
     private String pendingAttachment = "";
     private boolean agentRunning;
     private final ArrayDeque<String> promptQueue = new ArrayDeque<>();
+    private final Handler pluginSearchHandler = new Handler(Looper.getMainLooper());
+    private Runnable pendingPluginSearch;
 
     @Override protected void onCreate(Bundle state) {
         String requestedTheme = getSharedPreferences("dsh_settings", MODE_PRIVATE).getString("theme", "system");
@@ -85,9 +89,14 @@ public final class MainActivity extends Activity {
         store = new AppStore(this);
         secrets = new SecretStore(this);
         runtime = new AgentRuntime(store, secrets);
-        activeSession = store.sessions().get(0);
+        String restoredSession = state == null ? "" : state.getString("active_session", "");
+        activeSession = findSession(restoredSession);
+        pendingAttachment = state == null ? "" : state.getString("pending_attachment", "");
         buildShell();
-        showSessions();
+        restoreScreen(state == null ? "sessions" : state.getString("screen", "sessions"));
+        if (!store.persistenceWarning().trim().isEmpty()) {
+            Toast.makeText(this, store.persistenceWarning(), Toast.LENGTH_LONG).show();
+        }
     }
 
     private void applyPalette() {
@@ -99,8 +108,30 @@ public final class MainActivity extends Activity {
     }
 
     @Override protected void onDestroy() {
+        pluginSearchHandler.removeCallbacksAndMessages(null);
         runtime.close();
+        store.jobs().close();
         super.onDestroy();
+    }
+
+    @Override protected void onSaveInstanceState(Bundle state) {
+        state.putString("screen", screen);
+        state.putString("active_session", activeSession == null ? "" : activeSession.id);
+        state.putString("pending_attachment", pendingAttachment);
+        super.onSaveInstanceState(state);
+    }
+
+    private AppStore.Session findSession(String id) {
+        for (AppStore.Session session : store.sessions()) if (session.id.equals(id)) return session;
+        return store.sessions().get(0);
+    }
+
+    private void restoreScreen(String target) {
+        if ("chat".equals(target)) showChat();
+        else if ("workspace".equals(target)) showWorkspace();
+        else if ("tasks".equals(target)) showTasks();
+        else if ("settings".equals(target)) showSettings();
+        else showSessions();
     }
 
     @Override public void onBackPressed() {
@@ -293,6 +324,7 @@ public final class MainActivity extends Activity {
     }
 
     private void addMessageBubble(AppStore.Message message) {
+        if ("assistant".equals(message.role) && message.content.trim().isEmpty()) return;
         boolean user = "user".equals(message.role);
         boolean tool = "tool".equals(message.role);
         LinearLayout row = new LinearLayout(this);
@@ -311,9 +343,9 @@ public final class MainActivity extends Activity {
 
     private void send() {
         String prompt = chatInput.getText().toString().trim();
-        if (!pendingAttachment.isBlank()) prompt = (prompt.isBlank() ? "请查看这个附件" : prompt)
+        if (!pendingAttachment.trim().isEmpty()) prompt = (prompt.trim().isEmpty() ? "请查看这个附件" : prompt)
                 + "\n\n[附件已导入工作区: " + pendingAttachment + "]";
-        if (prompt.isBlank()) return;
+        if (prompt.trim().isEmpty()) return;
         if (agentRunning) {
             promptQueue.add(prompt); chatInput.setText("");
             chatStatus.setText("已排队 " + promptQueue.size() + " 条消息"); return;
@@ -400,10 +432,10 @@ public final class MainActivity extends Activity {
         LinearLayout column = column(dp(8));
         column.setPadding(dp(14), dp(14), dp(14), dp(24));
         scroll.addView(column, new ScrollView.LayoutParams(-1, -2));
-        TextView path = text("工作区 / " + (relative.isBlank() ? "" : relative), 13, MUTED, false);
+        TextView path = text("工作区 / " + (relative.trim().isEmpty() ? "" : relative), 13, MUTED, false);
         path.setPadding(dp(8), dp(5), dp(8), dp(9));
         column.addView(path, matchWrap());
-        if (!relative.isBlank()) {
+        if (!relative.trim().isEmpty()) {
             TextView up = fileRow("← 上一级", true);
             File parent = directory.getParentFile();
             String parentRelative = relative.contains("/") ? relative.substring(0, relative.lastIndexOf('/')) : "";
@@ -413,7 +445,7 @@ public final class MainActivity extends Activity {
         File[] files = directory.listFiles();
         if (files == null || files.length == 0) column.addView(text("工作区还是空的。可导入文件，或让 Agent 创建。", 14, MUTED, false), matchWrap());
         else for (File file : files) {
-            String nextRelative = relative.isBlank() ? file.getName() : relative + "/" + file.getName();
+            String nextRelative = relative.trim().isEmpty() ? file.getName() : relative + "/" + file.getName();
             TextView row = fileRow((file.isDirectory() ? "📁  " : "📄  ") + file.getName(), file.isDirectory());
             row.setOnClickListener(v -> {
                 if (file.isDirectory()) showDirectory(file, nextRelative); else showFile(file, nextRelative);
@@ -584,8 +616,7 @@ public final class MainActivity extends Activity {
         form.addView(permission, new LinearLayout.LayoutParams(-1, dp(52)));
 
         form.addView(label("语言"), matchWrap());
-        Spinner language = spinner(new String[]{"中文", "English"});
-        language.setSelection("en".equals(store.language()) ? 1 : 0);
+        Spinner language = spinner(new String[]{"中文（当前版本）"});
         form.addView(language, new LinearLayout.LayoutParams(-1, dp(52)));
 
         form.addView(label("外观"), matchWrap());
@@ -606,7 +637,7 @@ public final class MainActivity extends Activity {
         save.setOnClickListener(v -> {
             String permissionMode = permission.getSelectedItemPosition() == 2 ? "full" :
                     (permission.getSelectedItemPosition() == 1 ? "workspace" : "ask");
-            String lang = language.getSelectedItemPosition() == 1 ? "en" : "zh-CN";
+            String lang = "zh-CN";
             String themeId = new String[]{"light", "dark", "system"}[theme.getSelectedItemPosition()];
             String enterId = enter.getSelectedItemPosition() == 1 ? "newline" : "send";
             boolean appearanceChanged = !themeId.equals(store.theme());
@@ -660,9 +691,12 @@ public final class MainActivity extends Activity {
         for (View view : new View[]{name, id, base, model, protocol, key}) {
             LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, dp(50)); params.topMargin = dp(7); form.addView(view, params);
         }
-        AlertDialog dialog = new AlertDialog.Builder(this).setTitle(existing == null ? "添加自定义提供方" : "编辑提供方")
-                .setView(form).setNegativeButton("取消", null).setPositiveButton("保存", null).create();
-        dialog.setOnShowListener(ignored -> dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
+        AlertDialog.Builder builder = new AlertDialog.Builder(this).setTitle(existing == null ? "添加自定义提供方" : "编辑提供方")
+                .setView(form).setNegativeButton("取消", null).setPositiveButton("保存", null);
+        if (existing != null) builder.setNeutralButton(existing.builtIn() ? "清除密钥" : "删除提供方", null);
+        AlertDialog dialog = builder.create();
+        dialog.setOnShowListener(ignored -> {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
             if (name.getText().toString().trim().isEmpty()) { name.setError("请填写名称"); return; }
             if (!base.getText().toString().trim().startsWith("https://")) { base.setError("必须使用 HTTPS"); return; }
             if (model.getText().toString().trim().isEmpty()) { model.setError("请填写模型 ID"); return; }
@@ -671,15 +705,22 @@ public final class MainActivity extends Activity {
             AppStore.ProviderProfile profile = new AppStore.ProviderProfile(id.getText().toString().trim(),
                     name.getText().toString().trim(), base.getText().toString().trim(), model.getText().toString().trim(),
                     protocolId, java.util.Collections.singletonList(model.getText().toString().trim()), existing != null && existing.builtIn());
-            store.upsertProvider(profile);
             try {
-                if (!key.getText().toString().isBlank()) secrets.put(profile.id(), key.getText().toString().trim());
+                store.upsertProvider(profile);
+                if (!key.getText().toString().trim().isEmpty()) secrets.put(profile.id(), key.getText().toString().trim());
             } catch (Exception error) {
-                Toast.makeText(this, "密钥保存失败：" + error.getMessage(), Toast.LENGTH_LONG).show(); return;
+                Toast.makeText(this, "保存失败：" + error.getMessage(), Toast.LENGTH_LONG).show(); return;
             }
             if (existing == null) store.setActiveProvider(profile.id());
             dialog.dismiss(); showModelsSettings();
-        }));
+            });
+            if (existing != null) dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(v -> {
+                secrets.delete(existing.id());
+                if (!existing.builtIn()) store.removeProvider(existing.id());
+                dialog.dismiss(); showModelsSettings();
+                Toast.makeText(this, existing.builtIn() ? "密钥已清除" : "自定义提供方已删除", Toast.LENGTH_SHORT).show();
+            });
+        });
         dialog.show();
     }
 
@@ -690,7 +731,7 @@ public final class MainActivity extends Activity {
         LinearLayout tabs = new LinearLayout(this);
         Button config = secondaryButton("插件配置"); Button list = secondaryButton("插件列表");
         config.setTextColor("config".equals(active) ? BLUE : MUTED); list.setTextColor("list".equals(active) ? BLUE : MUTED);
-        config.setOnClickListener(v -> showPluginConfiguration()); list.setOnClickListener(v -> showPluginList(""));
+        config.setOnClickListener(v -> showPluginConfiguration()); list.setOnClickListener(v -> showPluginList("", false));
         tabs.addView(config, new LinearLayout.LayoutParams(0, dp(44), 1));
         LinearLayout.LayoutParams listParams = new LinearLayout.LayoutParams(0, dp(44), 1); listParams.leftMargin = dp(7);
         tabs.addView(list, listParams); form.addView(tabs, matchWrap());
@@ -700,11 +741,12 @@ public final class MainActivity extends Activity {
     private void showPluginConfiguration() {
         LinearLayout form = pluginHeader("config");
         addPluginConfigCard(form, "终端", "限制 Agent 运行的每一条命令。",
-                "超时 " + store.shellTimeoutSeconds() + " 秒 · 每流 " + store.shellOutputKb() + " KiB", () -> editShellConfig());
-        addPluginConfigCard(form, "Agent 循环", "控制工具调用与执行策略。",
-                "最多并行 " + store.maxParallelTools() + " 个工具", () -> editAgentLoopConfig());
-        addPluginConfigCard(form, "网页搜索", "DeepSeek 搜索提供方及网页获取限制。",
-                "每次最多 " + store.maxWebSearches() + " 个搜索", () -> editWebConfig());
+                "命令 " + store.shellTimeoutSeconds() + " 秒 · Job " + store.jobTimeoutSeconds()
+                        + " 秒 / 最多 " + store.maxConcurrentJobs() + " 个", () -> editShellConfig());
+        addPluginConfigCard(form, "Agent 循环", "限制模型单轮发起的工具调用数量。",
+                "单轮最多 " + store.maxToolCallsPerTurn() + " 个工具调用", () -> editAgentLoopConfig());
+        addPluginConfigCard(form, "网页访问", "限制每轮 Agent 主动发起的 HTTPS 获取次数。",
+                "每轮最多 " + store.maxWebRequests() + " 次获取", () -> editWebConfig());
     }
 
     private void addPluginConfigCard(LinearLayout form, String title, String subtitle, String value, Runnable action) {
@@ -717,39 +759,61 @@ public final class MainActivity extends Activity {
     private void editShellConfig() {
         EditText timeout = numberField("命令超时（秒）", store.shellTimeoutSeconds());
         EditText output = numberField("每流输出上限（KiB）", store.shellOutputKb());
-        showTwoNumberDialog("终端", timeout, output, () -> store.savePluginConfig(parseInt(timeout, 20), parseInt(output, 64),
-                store.maxParallelTools(), store.maxWebSearches()));
+        EditText jobTimeout = numberField("后台 Job 超时（秒）", store.jobTimeoutSeconds());
+        EditText maxJobs = numberField("最多并发 Job（1–4）", store.maxConcurrentJobs());
+        showNumberDialog("终端与后台任务", new EditText[]{timeout, output, jobTimeout, maxJobs}, () ->
+                store.savePluginConfig(parseInt(timeout, 20), parseInt(output, 64), store.maxToolCallsPerTurn(),
+                        store.maxWebRequests(), parseInt(jobTimeout, 300), parseInt(maxJobs, 2)));
     }
 
     private void editAgentLoopConfig() {
-        EditText parallel = numberField("最大并行工具数", store.maxParallelTools());
+        EditText parallel = numberField("单轮最大工具调用数", store.maxToolCallsPerTurn());
         showOneNumberDialog("Agent 循环", parallel, () -> store.savePluginConfig(store.shellTimeoutSeconds(),
-                store.shellOutputKb(), parseInt(parallel, 3), store.maxWebSearches()));
+                store.shellOutputKb(), parseInt(parallel, 3), store.maxWebRequests(),
+                store.jobTimeoutSeconds(), store.maxConcurrentJobs()));
     }
 
     private void editWebConfig() {
-        EditText searches = numberField("每次最大搜索数", store.maxWebSearches());
-        showOneNumberDialog("网页搜索", searches, () -> store.savePluginConfig(store.shellTimeoutSeconds(),
-                store.shellOutputKb(), store.maxParallelTools(), parseInt(searches, 5)));
+        EditText searches = numberField("每轮最大 HTTPS 获取数", store.maxWebRequests());
+        showOneNumberDialog("网页访问", searches, () -> store.savePluginConfig(store.shellTimeoutSeconds(),
+                store.shellOutputKb(), store.maxToolCallsPerTurn(), parseInt(searches, 5),
+                store.jobTimeoutSeconds(), store.maxConcurrentJobs()));
     }
 
-    private void showPluginList(String query) {
+    private void showPluginList(String query) { showPluginList(query, false); }
+
+    private void showPluginList(String query, boolean showCompatibility) {
         LinearLayout form = pluginHeader("list");
         EditText search = field("搜索插件", query, false); form.addView(search, new LinearLayout.LayoutParams(-1, dp(50)));
-        TextView count = text("插件列表  " + PluginCatalog.all().size(), 15, INK, true);
+        TextView count = text("原生可用 " + PluginCatalog.nativeCount() + " · 上游兼容标识 "
+                + (PluginCatalog.all().size() - PluginCatalog.nativeCount()), 15, INK, true);
         count.setPadding(0, dp(12), 0, dp(4)); form.addView(count, matchWrap());
         String needle = query.toLowerCase(Locale.ROOT).trim();
+        boolean includeCompatibility = showCompatibility || !needle.isEmpty();
+        if (needle.isEmpty()) {
+            Button compatibility = secondaryButton(showCompatibility ? "收起兼容标识" : "显示全部兼容标识");
+            compatibility.setOnClickListener(v -> showPluginList("", !showCompatibility));
+            LinearLayout.LayoutParams buttonParams = new LinearLayout.LayoutParams(-1, dp(44));
+            buttonParams.topMargin = dp(6); form.addView(compatibility, buttonParams);
+        }
         for (PluginCatalog.Entry entry : PluginCatalog.all()) {
+            if (!includeCompatibility && entry.availability() != PluginCatalog.Availability.NATIVE) continue;
             if (!needle.isEmpty() && !entry.id().toLowerCase(Locale.ROOT).contains(needle)
                     && !entry.moduleName().toLowerCase(Locale.ROOT).contains(needle)) continue;
             LinearLayout row = new LinearLayout(this); row.setGravity(Gravity.CENTER_VERTICAL);
             row.setPadding(dp(13), dp(8), dp(8), dp(8)); row.setBackground(round(CARD, 13));
             TextView details = text(entry.id() + "\n" + entry.kind().name().toLowerCase(Locale.ROOT), 14, INK, true);
             row.addView(details, new LinearLayout.LayoutParams(0, -2, 1));
-            Switch toggle = new Switch(this); toggle.setContentDescription("启用 " + entry.id());
-            toggle.setChecked(PluginCatalog.enabled(store.settings(), entry.id()));
-            toggle.setOnCheckedChangeListener((button, checked) -> PluginCatalog.setEnabled(store.settings(), entry.id(), checked));
-            row.addView(toggle, new LinearLayout.LayoutParams(-2, dp(48)));
+            if (entry.availability() == PluginCatalog.Availability.NATIVE) {
+                Switch toggle = new Switch(this); toggle.setContentDescription("启用 " + entry.id());
+                toggle.setChecked(PluginCatalog.enabled(store.settings(), entry.id()));
+                toggle.setOnCheckedChangeListener((button, checked) -> PluginCatalog.setEnabled(store.settings(), entry.id(), checked));
+                row.addView(toggle, new LinearLayout.LayoutParams(-2, dp(48)));
+            } else {
+                TextView badge = text("仅兼容标识", 12, MUTED, false);
+                badge.setPadding(dp(8), dp(6), dp(8), dp(6));
+                row.addView(badge, new LinearLayout.LayoutParams(-2, -2));
+            }
             LinearLayout.LayoutParams params = matchWrap(); params.topMargin = dp(7); form.addView(row, params);
         }
         search.addTextChangedListener(new TextWatcher() {
@@ -757,7 +821,11 @@ public final class MainActivity extends Activity {
             @Override public void onTextChanged(CharSequence s, int start, int before, int count) {}
             @Override public void afterTextChanged(Editable s) {
                 String next = s.toString();
-                if (!next.equals(query)) { showPluginList(next); }
+                if (!next.equals(query)) {
+                    if (pendingPluginSearch != null) pluginSearchHandler.removeCallbacks(pendingPluginSearch);
+                    pendingPluginSearch = () -> showPluginList(next, showCompatibility);
+                    pluginSearchHandler.postDelayed(pendingPluginSearch, 180);
+                }
             }
         });
         search.requestFocus(); search.setSelection(search.length());
@@ -864,7 +932,7 @@ public final class MainActivity extends Activity {
         new AlertDialog.Builder(this).setTitle("添加任务").setView(input)
                 .setNegativeButton("取消", null).setPositiveButton("添加", (d, w) -> {
                     String value = input.getText().toString().trim();
-                    if (!value.isBlank()) store.addPlan(activeSession, value);
+                    if (!value.trim().isEmpty()) store.addPlan(activeSession, value);
                     showPlans();
                 }).show();
     }
@@ -959,6 +1027,16 @@ public final class MainActivity extends Activity {
         LinearLayout form = column(0); form.setPadding(dp(18), 0, dp(18), 0);
         form.addView(first, new LinearLayout.LayoutParams(-1, dp(52)));
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, dp(52)); params.topMargin = dp(8); form.addView(second, params);
+        new AlertDialog.Builder(this).setTitle(title).setView(form).setNegativeButton("取消", null)
+                .setPositiveButton("保存", (d, w) -> { save.run(); showPluginConfiguration(); }).show();
+    }
+
+    private void showNumberDialog(String title, EditText[] fields, Runnable save) {
+        LinearLayout form = column(0); form.setPadding(dp(18), 0, dp(18), 0);
+        for (EditText field : fields) {
+            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, dp(52));
+            params.topMargin = dp(8); form.addView(field, params);
+        }
         new AlertDialog.Builder(this).setTitle(title).setView(form).setNegativeButton("取消", null)
                 .setPositiveButton("保存", (d, w) -> { save.run(); showPluginConfiguration(); }).show();
     }

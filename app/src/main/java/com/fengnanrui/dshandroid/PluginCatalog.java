@@ -11,8 +11,9 @@ import java.util.Set;
 
 /** Native compatibility inventory derived from the current upstream base, web and preset compositions. */
 public final class PluginCatalog {
-    public record Entry(String id, String moduleName, Kind kind) {}
+    public record Entry(String id, String moduleName, Kind kind, Availability availability) {}
     public enum Kind { RUNTIME, TOOL, UI, PROVIDER, STORAGE, POLICY }
+    public enum Availability { NATIVE, COMPATIBILITY_ONLY }
 
     private static final String[] IDS = {
             "timer", "hmr", "llm", "session", "typert", "typert-loader", "typert-gateway",
@@ -49,22 +50,39 @@ public final class PluginCatalog {
             "tool-subagent-report", "tool-workflow", "tool-todo", "tool-goal", "tool-ralph",
             "tool-str-replace-editor", "tool-web", "tool-ask-user"));
 
+    /** Only these entries have a concrete Android implementation and a meaningful switch. */
+    private static final Set<String> NATIVE_IDS = new HashSet<>(Arrays.asList(
+            "llm", "agent", "agent-loop", "timer", "tool-bash", "tool-jobs", "tool-fs",
+            "tool-fs-search", "tool-str-replace-editor", "tool-web", "tool-todo", "tool-goal",
+            "tool-workflow", "tool-skill", "tool-subagent", "tool-ask-user", "plugin-inventory",
+            "settings", "code-runtime", "agent-presets"));
+
     private PluginCatalog() {}
 
     public static List<Entry> all() {
         List<Entry> result = new ArrayList<>(IDS.length);
-        for (String id : IDS) result.add(new Entry(id, moduleName(id), kind(id)));
+        for (String id : IDS) result.add(new Entry(id, moduleName(id), kind(id), availability(id)));
         return result;
     }
 
+    public static int nativeCount() { return NATIVE_IDS.size(); }
+
+    public static boolean isNative(String id) { return NATIVE_IDS.contains(id); }
+
     public static boolean enabled(SharedPreferences settings, String id) {
+        if (!isNative(id)) return false;
         return !settings.getStringSet("disabled_plugins", Collections.emptySet()).contains(id);
     }
 
     public static void setEnabled(SharedPreferences settings, String id, boolean enabled) {
+        if (!isNative(id)) return;
         Set<String> disabled = new HashSet<>(settings.getStringSet("disabled_plugins", Collections.emptySet()));
         if (enabled) disabled.remove(id); else disabled.add(id);
         settings.edit().putStringSet("disabled_plugins", disabled).apply();
+    }
+
+    private static Availability availability(String id) {
+        return isNative(id) ? Availability.NATIVE : Availability.COMPATIBILITY_ONLY;
     }
 
     private static Kind kind(String id) {

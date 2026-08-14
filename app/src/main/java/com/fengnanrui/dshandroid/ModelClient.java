@@ -43,7 +43,7 @@ public final class ModelClient {
 
     public Completion complete(ProviderRegistry.Provider provider, String baseUrl, String model,
                                String apiKey, JSONArray conversation, JSONArray tools) throws Exception {
-        if (apiKey == null || apiKey.isBlank()) throw new IllegalStateException("请先在设置中保存 API Key");
+        if (apiKey == null || apiKey.trim().isEmpty()) throw new IllegalStateException("请先在设置中保存 API Key");
         if (!baseUrl.startsWith("https://")) throw new SecurityException("模型地址必须使用 HTTPS");
         return switch (provider.protocol()) {
             case OPENAI -> openAi(baseUrl, model, apiKey, conversation, tools);
@@ -183,7 +183,7 @@ public final class ModelClient {
                 continue;
             }
             JSONArray blocks = new JSONArray();
-            if (!message.optString("content").isBlank()) blocks.put(new JSONObject().put("type", "text")
+            if (!message.optString("content").trim().isEmpty()) blocks.put(new JSONObject().put("type", "text")
                     .put("text", message.optString("content")));
             JSONArray calls = message.optJSONArray("_toolCalls");
             if (calls != null) for (int j = 0; j < calls.length(); j++) {
@@ -210,7 +210,7 @@ public final class ModelClient {
                                 .put("result", message.optString("content")))));
                 role = "user";
             } else {
-                if (!message.optString("content").isBlank()) parts.put(new JSONObject().put("text", message.optString("content")));
+                if (!message.optString("content").trim().isEmpty()) parts.put(new JSONObject().put("text", message.optString("content")));
                 JSONArray calls = message.optJSONArray("_toolCalls");
                 if (calls != null) for (int j = 0; j < calls.length(); j++) {
                     JSONObject call = calls.getJSONObject(j);
@@ -264,7 +264,7 @@ public final class ModelClient {
         connection.setDoOutput(true);
         connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
         connection.setRequestProperty("Accept", "application/json");
-        connection.setRequestProperty("User-Agent", "DSH-Android/1.1");
+        connection.setRequestProperty("User-Agent", "DSH-Android/0.1.9");
         for (String[] header : headers) connection.setRequestProperty(header[0], header[1]);
         byte[] body = request.toString().getBytes(StandardCharsets.UTF_8);
         connection.setFixedLengthStreamingMode(body.length);

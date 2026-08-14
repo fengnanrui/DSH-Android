@@ -9,6 +9,7 @@ import org.json.JSONObject;
 import java.io.File;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -21,11 +22,18 @@ public final class AppStore {
         public String role;
         public String content;
         public String toolName;
+        public String toolCallId;
+        public String canonicalJson;
         public long time;
 
-        public Message(String role, String content) { this(role, content, "", System.currentTimeMillis()); }
+        public Message(String role, String content) { this(role, content, "", "", "", System.currentTimeMillis()); }
         public Message(String role, String content, String toolName, long time) {
-            this.role = role; this.content = content; this.toolName = toolName; this.time = time;
+            this(role, content, toolName, "", "", time);
+        }
+        public Message(String role, String content, String toolName, String toolCallId,
+                       String canonicalJson, long time) {
+            this.role = role; this.content = content; this.toolName = toolName;
+            this.toolCallId = toolCallId; this.canonicalJson = canonicalJson; this.time = time;
         }
     }
 
@@ -81,17 +89,28 @@ public final class AppStore {
             new AgentPreset("cordis", "创造模式", "标准能力加运行时检查、插件实验与预设创建指导。", true, "cordis"));
 
     private final File sessionsFile;
+    private final File sessionsBackupFile;
     private final File workspace;
     private final SharedPreferences settings;
+    private final JobManager jobs;
     private final List<Session> sessions = new ArrayList<>();
+    private String persistenceWarning = "";
 
     public AppStore(Context context) {
-        File stateDir = new File(context.getFilesDir(), "state");
+        this(context, "");
+    }
+
+    /** Separate namespace is used by instrumentation so tests never touch user data. */
+    AppStore(Context context, String namespace) {
+        String suffix = namespace == null || namespace.trim().isEmpty() ? "" : "_" + namespace;
+        File stateDir = new File(context.getFilesDir(), "state" + suffix);
         if (!stateDir.exists()) stateDir.mkdirs();
         sessionsFile = new File(stateDir, "sessions.json");
-        workspace = new File(context.getFilesDir(), "workspaces/default");
+        sessionsBackupFile = new File(stateDir, "sessions.backup.json");
+        workspace = new File(context.getFilesDir(), "workspaces/default" + suffix);
         if (!workspace.exists()) workspace.mkdirs();
-        settings = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+        settings = context.getSharedPreferences(PREFS + suffix, Context.MODE_PRIVATE);
+        jobs = new JobManager(workspace, this);
         migrateLegacyProvider();
         load();
     }
@@ -151,36 +170,48 @@ public final class AppStore {
             for (Session session : sessions) root.put(toJson(session));
             File temporary = new File(sessionsFile.getParentFile(), "sessions.tmp");
             Files.write(temporary.toPath(), root.toString(2).getBytes(StandardCharsets.UTF_8));
-            if (!temporary.renameTo(sessionsFile)) {
-                Files.write(sessionsFile.toPath(), root.toString(2).getBytes(StandardCharsets.UTF_8));
-                temporary.delete();
-            }
-        } catch (Exception ignored) {}
+            if (sessionsFile.isFile()) Files.copy(sessionsFile.toPath(), sessionsBackupFile.toPath(),
+                    StandardCopyOption.REPLACE_EXISTING);
+            Files.move(temporary.toPath(), sessionsFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            persistenceWarning = "";
+        } catch (Exception error) {
+            persistenceWarning = "会话保存失败：" + safeMessage(error);
+            throw new IllegalStateException(persistenceWarning, error);
+        }
     }
 
     public File workspace() { return workspace; }
+    public JobManager jobs() { return jobs; }
+    public String persistenceWarning() { return persistenceWarning; }
     public SharedPreferences settings() { return settings; }
     public String permissionMode() { return settings.getString("permission_mode", "ask"); }
     public String agentInstructions() { return settings.getString("agent_instructions", ""); }
-    public String language() { return settings.getString("language", "zh-CN"); }
+    public String language() { return "zh-CN"; }
     public String theme() { return settings.getString("theme", "system"); }
     public String enterBehavior() { return settings.getString("enter_behavior", "send"); }
     public int shellTimeoutSeconds() { return settings.getInt("shell_timeout_seconds", 20); }
     public int shellOutputKb() { return settings.getInt("shell_output_kb", 64); }
-    public int maxParallelTools() { return settings.getInt("max_parallel_tools", 3); }
-    public int maxWebSearches() { return settings.getInt("max_web_searches", 5); }
+    public int maxToolCallsPerTurn() {
+        return settings.getInt("max_tool_calls_per_turn", settings.getInt("max_parallel_tools", 3));
+    }
+    public int maxWebRequests() { return settings.getInt("max_web_requests", settings.getInt("max_web_searches", 5)); }
+    public int jobTimeoutSeconds() { return settings.getInt("job_timeout_seconds", 300); }
+    public int maxConcurrentJobs() { return settings.getInt("max_concurrent_jobs", 2); }
     public String defaultPresetId() { return settings.getString("default_preset", "standard"); }
 
     public void saveGeneral(String permission, String language, String theme, String enterBehavior) {
-        settings.edit().putString("permission_mode", permission).putString("language", language)
+        settings.edit().putString("permission_mode", permission).putString("language", "zh-CN")
                 .putString("theme", theme).putString("enter_behavior", enterBehavior).apply();
     }
 
-    public void savePluginConfig(int timeout, int outputKb, int parallel, int searches) {
+    public void savePluginConfig(int timeout, int outputKb, int toolCallsPerTurn, int webRequests,
+                                 int jobTimeout, int maxJobs) {
         settings.edit().putInt("shell_timeout_seconds", Math.max(1, Math.min(300, timeout)))
                 .putInt("shell_output_kb", Math.max(8, Math.min(1024, outputKb)))
-                .putInt("max_parallel_tools", Math.max(1, Math.min(16, parallel)))
-                .putInt("max_web_searches", Math.max(1, Math.min(20, searches))).apply();
+                .putInt("max_tool_calls_per_turn", Math.max(1, Math.min(16, toolCallsPerTurn)))
+                .putInt("max_web_requests", Math.max(1, Math.min(20, webRequests)))
+                .putInt("job_timeout_seconds", Math.max(10, Math.min(3600, jobTimeout)))
+                .putInt("max_concurrent_jobs", Math.max(1, Math.min(4, maxJobs))).apply();
     }
 
     public void saveAgentInstructions(String value) {
@@ -189,10 +220,14 @@ public final class AppStore {
 
     public List<ProviderProfile> providerProfiles() {
         List<ProviderProfile> profiles = new ArrayList<>();
+        String raw = settings.getString("providers_json", "[]");
         try {
-            JSONArray array = new JSONArray(settings.getString("providers_json", "[]"));
+            JSONArray array = new JSONArray(raw);
             for (int i = 0; i < array.length(); i++) profiles.add(providerFromJson(array.getJSONObject(i)));
-        } catch (Exception ignored) {}
+        } catch (Exception error) {
+            settings.edit().putString("providers_json_corrupt", raw).remove("providers_json").apply();
+            appendWarning("模型配置损坏，原始内容已保留并恢复默认值");
+        }
         if (profiles.isEmpty()) {
             for (ProviderRegistry.Provider p : ProviderRegistry.all()) {
                 if (!"custom".equals(p.id())) profiles.add(new ProviderProfile(p.id(), p.name(), p.baseUrl(),
@@ -224,9 +259,10 @@ public final class AppStore {
 
     public void removeProvider(String id) {
         List<ProviderProfile> profiles = providerProfiles();
+        boolean wasActive = id.equals(activeProviderProfile().id());
         profiles.removeIf(p -> p.id().equals(id) && !p.builtIn());
         saveProviders(profiles);
-        if (id.equals(activeProviderProfile().id())) setActiveProvider(profiles.get(0).id());
+        if (wasActive && !profiles.isEmpty()) setActiveProvider(profiles.get(0).id());
     }
 
     public String providerId() { return activeProviderProfile().id(); }
@@ -248,14 +284,18 @@ public final class AppStore {
 
     public List<AgentPreset> presets() {
         List<AgentPreset> result = new ArrayList<>(BUILT_IN_PRESETS);
+        String raw = settings.getString("custom_presets_json", "[]");
         try {
-            JSONArray custom = new JSONArray(settings.getString("custom_presets_json", "[]"));
+            JSONArray custom = new JSONArray(raw);
             for (int i = 0; i < custom.length(); i++) {
                 JSONObject item = custom.getJSONObject(i);
                 result.add(new AgentPreset(item.getString("id"), item.getString("name"),
                         item.optString("description"), false, item.optString("baseId", "standard")));
             }
-        } catch (Exception ignored) {}
+        } catch (Exception error) {
+            settings.edit().putString("custom_presets_json_corrupt", raw).remove("custom_presets_json").apply();
+            appendWarning("自定义预设损坏，原始内容已保留");
+        }
         return result;
     }
 
@@ -274,7 +314,9 @@ public final class AppStore {
             custom.put(new JSONObject().put("id", "custom-" + UUID.randomUUID()).put("name", name)
                     .put("description", description).put("baseId", baseId));
             settings.edit().putString("custom_presets_json", custom.toString()).apply();
-        } catch (Exception ignored) {}
+        } catch (Exception error) {
+            throw new IllegalStateException("无法保存自定义预设：" + safeMessage(error), error);
+        }
     }
 
     public JSONObject exportConfig() throws Exception {
@@ -287,7 +329,8 @@ public final class AppStore {
                 .put("permission", permissionMode()).put("language", language()).put("theme", theme())
                 .put("enterBehavior", enterBehavior()).put("disabledPlugins", disabled)
                 .put("shellTimeoutSeconds", shellTimeoutSeconds()).put("shellOutputKb", shellOutputKb())
-                .put("maxParallelTools", maxParallelTools()).put("maxWebSearches", maxWebSearches());
+                .put("maxToolCallsPerTurn", maxToolCallsPerTurn()).put("maxWebRequests", maxWebRequests())
+                .put("jobTimeoutSeconds", jobTimeoutSeconds()).put("maxConcurrentJobs", maxConcurrentJobs());
     }
 
     private void migrateLegacyProvider() {
@@ -309,8 +352,12 @@ public final class AppStore {
     private void saveProviders(List<ProviderProfile> profiles) {
         JSONArray array = new JSONArray();
         try { for (ProviderProfile p : profiles) array.put(providerToJson(p)); }
-        catch (Exception ignored) {}
+        catch (Exception error) { throw new IllegalStateException("无法保存模型配置：" + safeMessage(error), error); }
         settings.edit().putString("providers_json", array.toString()).apply();
+    }
+
+    private void appendWarning(String warning) {
+        persistenceWarning = persistenceWarning.trim().isEmpty() ? warning : persistenceWarning + "；" + warning;
     }
 
     private static JSONObject providerToJson(ProviderProfile p) throws Exception {
@@ -332,12 +379,25 @@ public final class AppStore {
     }
 
     private void load() {
-        try {
-            if (sessionsFile.isFile()) {
-                JSONArray root = new JSONArray(new String(Files.readAllBytes(sessionsFile.toPath()), StandardCharsets.UTF_8));
-                for (int i = 0; i < root.length(); i++) sessions.add(fromJson(root.getJSONObject(i)));
+        boolean loaded = false;
+        if (sessionsFile.isFile()) {
+            try {
+                readSessions(sessionsFile); loaded = true;
+            } catch (Exception error) {
+                sessions.clear();
+                persistenceWarning = "主会话文件损坏，已尝试从备份恢复";
+                preserveCorruptFile();
             }
-        } catch (Exception ignored) { sessions.clear(); }
+        }
+        if (!loaded && sessionsBackupFile.isFile()) {
+            try {
+                readSessions(sessionsBackupFile); loaded = true;
+                persistenceWarning = "主会话文件损坏，当前内容来自自动备份";
+            } catch (Exception error) {
+                sessions.clear();
+                persistenceWarning = "主会话和备份均无法读取，损坏文件已保留";
+            }
+        }
         boolean keptEmpty = false;
         for (int i = sessions.size() - 1; i >= 0; i--) {
             Session session = sessions.get(i);
@@ -345,7 +405,29 @@ public final class AppStore {
                     && session.workflows.isEmpty() && "新会话".equals(session.title);
             if (empty && keptEmpty) sessions.remove(i); else if (empty) keptEmpty = true;
         }
+        String recoveryWarning = persistenceWarning;
         if (sessions.isEmpty()) createSession(); else save();
+        if (!recoveryWarning.trim().isEmpty()) persistenceWarning = recoveryWarning;
+    }
+
+    private void readSessions(File source) throws Exception {
+        JSONArray root = new JSONArray(new String(Files.readAllBytes(source.toPath()), StandardCharsets.UTF_8));
+        for (int i = 0; i < root.length(); i++) sessions.add(fromJson(root.getJSONObject(i)));
+    }
+
+    private void preserveCorruptFile() {
+        try {
+            File corrupt = new File(sessionsFile.getParentFile(),
+                    "sessions.corrupt." + System.currentTimeMillis() + ".json");
+            Files.move(sessionsFile.toPath(), corrupt.toPath(), StandardCopyOption.REPLACE_EXISTING);
+        } catch (Exception error) {
+            persistenceWarning += "；损坏文件重命名失败：" + safeMessage(error);
+        }
+    }
+
+    private static String safeMessage(Throwable error) {
+        String message = error.getMessage();
+        return message == null || message.trim().isEmpty() ? error.getClass().getSimpleName() : message;
     }
 
     private static JSONObject toJson(Session session) throws Exception {
@@ -353,7 +435,9 @@ public final class AppStore {
                 .put("presetId", session.presetId).put("createdAt", session.createdAt).put("updatedAt", session.updatedAt);
         JSONArray messages = new JSONArray();
         for (Message message : session.messages) messages.put(new JSONObject().put("role", message.role)
-                .put("content", message.content).put("toolName", message.toolName).put("time", message.time));
+                .put("content", message.content).put("toolName", message.toolName)
+                .put("toolCallId", message.toolCallId).put("canonicalJson", message.canonicalJson)
+                .put("time", message.time));
         JSONArray plan = new JSONArray();
         for (PlanItem item : session.plan) plan.put(new JSONObject().put("id", item.id)
                 .put("text", item.text).put("done", item.done));
@@ -377,7 +461,8 @@ public final class AppStore {
         if (messages != null) for (int i = 0; i < messages.length(); i++) {
             JSONObject item = messages.getJSONObject(i);
             session.messages.add(new Message(item.optString("role"), item.optString("content"),
-                    item.optString("toolName"), item.optLong("time")));
+                    item.optString("toolName"), item.optString("toolCallId"),
+                    item.optString("canonicalJson"), item.optLong("time")));
         }
         JSONArray plan = json.optJSONArray("plan");
         if (plan != null) for (int i = 0; i < plan.length(); i++) {

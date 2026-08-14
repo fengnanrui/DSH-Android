@@ -50,8 +50,21 @@ public final class MobileToolsTest {
 
     @Test public void inventoryContainsAllStableUpstreamPluginIds() {
         assertTrue(PluginCatalog.all().size() == 136);
+        assertTrue(PluginCatalog.nativeCount() == 20);
         HashSet<String> ids = new HashSet<>();
         for (PluginCatalog.Entry entry : PluginCatalog.all()) ids.add(entry.id());
         assertTrue(ids.size() == PluginCatalog.all().size());
+        assertTrue(PluginCatalog.isNative("tool-bash"));
+        assertFalse(PluginCatalog.isNative("hmr"));
+    }
+
+    @Test public void presetsExposeDifferentNativeCapabilities() {
+        assertTrue(MobileTools.shouldInclude("minimal", "tool-bash"));
+        assertTrue(MobileTools.shouldInclude("minimal", "tool-str-replace-editor"));
+        assertFalse(MobileTools.shouldInclude("minimal", "tool-web"));
+        assertTrue(MobileTools.shouldInclude("code", "code-runtime"));
+        assertFalse(MobileTools.shouldInclude("standard", "code-runtime"));
+        assertTrue(MobileTools.shouldInclude("cordis", "plugin-inventory"));
+        assertFalse(MobileTools.shouldInclude("standard", "plugin-inventory"));
     }
 }

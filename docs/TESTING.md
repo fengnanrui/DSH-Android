@@ -3,11 +3,11 @@
 ## Automated checks
 
 ```bash
-ANDROID_HOME=/path/to/android-sdk ./gradlew testDebugUnitTest lintDebug assembleDebug
+ANDROID_HOME=/path/to/android-sdk ./gradlew testDebugUnitTest lintDebug assembleDebug assembleRelease
 ANDROID_HOME=/path/to/android-sdk ./gradlew connectedDebugAndroidTest
 ```
 
-单元测试核对供应商注册表、HTTPS 默认值、三种原生协议、工具边界和 136 个唯一稳定插件 ID。三项设备测试断言不存在 WebView，并实际遍历会话、四个设置面以及计划/目标/Jobs/工作流页面。
+单元测试核对供应商注册表、HTTPS 默认值、三种原生协议、工具边界、20 个原生插件与 116 个兼容标识，并验证四类预设的真实能力差异。七项设备测试断言不存在 WebView，遍历会话和运行中心，实际执行 PTC 原生步骤与 Job 并发限制，同时验证工具调用上下文持久化及损坏会话自动恢复。
 
 ## Functional regression
 
@@ -22,6 +22,7 @@ ANDROID_HOME=/path/to/android-sdk ./gradlew connectedDebugAndroidTest
 - [ ] `delegate_task` 返回独立子 Agent 的分析结果。
 - [ ] `ask_user` 暂停 Agent 并显示原生回答弹窗，回答后继续执行。
 - [ ] 启动、刷新和停止后台 Job，日志出现在私有工作区。
+- [ ] 后台 Job 达到并发上限会被拒绝，达到超时会终止，离开应用进程后不残留无限任务。
 - [ ] 从系统文件选择器导入文本附件并让 Agent 读取。
 - [ ] 切换 DeepSeek/OpenAI、Anthropic 与 Gemini 协议各完成一次请求。
 - [ ] 旋转、退到后台、进程重启后本地会话和工作区仍存在。

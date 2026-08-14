@@ -25,7 +25,7 @@ public final class SecretStore {
     }
 
     public synchronized void put(String providerId, String value) throws Exception {
-        if (value == null || value.isBlank()) {
+        if (value == null || value.trim().isEmpty()) {
             preferences.edit().remove(providerId).apply();
             return;
         }
@@ -39,7 +39,7 @@ public final class SecretStore {
 
     public synchronized String get(String providerId) throws Exception {
         String encoded = preferences.getString(providerId, "");
-        if (encoded == null || encoded.isBlank()) return "";
+        if (encoded == null || encoded.trim().isEmpty()) return "";
         String[] parts = encoded.split(":", 2);
         Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
         cipher.init(Cipher.DECRYPT_MODE, key(),
@@ -50,6 +50,10 @@ public final class SecretStore {
 
     public boolean has(String providerId) {
         return preferences.contains(providerId);
+    }
+
+    public void delete(String providerId) {
+        preferences.edit().remove(providerId).apply();
     }
 
     private SecretKey key() throws Exception {

@@ -14,18 +14,15 @@ import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /** Sandboxed native tools exposed according to the active preset and plugin inventory. */
 public final class MobileTools {
     public static final int MAX_FILE_BYTES = 256 * 1024;
-    private static final AtomicInteger NEXT_JOB = new AtomicInteger(1);
-    private static final ConcurrentHashMap<Integer, Process> JOBS = new ConcurrentHashMap<>();
     private final File workspace;
     private final AppStore store;
     private final AppStore.Session session;
+    private int webRequests;
 
     public MobileTools(File workspace, AppStore store, AppStore.Session session) {
         this.workspace = workspace; this.store = store; this.session = session;
@@ -73,14 +70,22 @@ public final class MobileTools {
                 prop("task", "string", "具体子任务"), prop("context", "string", "所需背景")), new JSONArray().put("task")));
         add(tools, store, session, "tool-ask-user", tool("ask_user", "需要用户决定或补充信息时显示原生提问框", props(
                 prop("question", "string", "要向用户提出的问题")), new JSONArray().put("question")));
-        add(tools, store, session, "plugin-inventory", tool("list_plugins", "列出原生兼容插件及状态", new JSONObject(), new JSONArray()));
+        add(tools, store, session, "code-runtime", tool("run_code_mode", "按顺序运行最多 8 个原生工具步骤；steps 是 JSON 数组字符串", props(
+                prop("steps", "string", "例如 [{\"tool\":\"read_file\",\"args\":{\"path\":\"README.md\"}}]")),
+                new JSONArray().put("steps")));
+        add(tools, store, session, "plugin-inventory", tool("list_plugins", "列出原生插件与仅兼容标识", new JSONObject(), new JSONArray()));
         add(tools, store, session, "settings", tool("export_config", "导出当前非敏感 DSH 配置", new JSONObject(), new JSONArray()));
+        add(tools, store, session, "agent-presets", tool("create_agent_preset", "创建真正绑定某一能力组的自定义预设", props(
+                prop("name", "string", "预设名称"), prop("description", "string", "用途说明"),
+                prop("base", "string", "standard、code、minimal 或 cordis")),
+                new JSONArray().put("name").put("base")));
         return tools;
     }
 
     public static boolean requiresApproval(String name) {
         return "write_file".equals(name) || "str_replace_editor".equals(name) || "run_shell".equals(name)
-                || "start_job".equals(name) || "stop_job".equals(name) || "fetch_url".equals(name);
+                || "start_job".equals(name) || "stop_job".equals(name) || "fetch_url".equals(name)
+                || "run_code_mode".equals(name) || "create_agent_preset".equals(name);
     }
 
     public String execute(String name, JSONObject args) throws Exception {
@@ -104,12 +109,14 @@ public final class MobileTools {
             case "read_skill" -> readSkill(args.getString("name"));
             case "list_plugins" -> listPlugins();
             case "export_config" -> store.exportConfig().toString(2);
+            case "run_code_mode" -> runCodeMode(args.getString("steps"));
+            case "create_agent_preset" -> createAgentPreset(args);
             default -> throw new IllegalArgumentException("未知工具: " + name);
         };
     }
 
     public File resolve(String relative) throws Exception {
-        String clean = relative == null || relative.isBlank() ? "." : relative;
+        String clean = relative == null || relative.trim().isEmpty() ? "." : relative;
         File root = workspace.getCanonicalFile();
         File target = new File(root, clean).getCanonicalFile();
         if (!target.equals(root) && !target.getPath().startsWith(root.getPath() + File.separator))
@@ -158,7 +165,7 @@ public final class MobileTools {
     }
 
     private String search(String query, String path) throws Exception {
-        if (query.isBlank()) throw new IllegalArgumentException("搜索内容为空");
+        if (query.trim().isEmpty()) throw new IllegalArgumentException("搜索内容为空");
         List<String> hits = new ArrayList<>();
         searchRecursive(resolve(path), query.toLowerCase(Locale.ROOT), hits);
         return hits.isEmpty() ? "没有匹配结果" : String.join("\n", hits.subList(0, Math.min(100, hits.size())));
@@ -193,7 +200,7 @@ public final class MobileTools {
     }
 
     private String runShell(String command) throws Exception {
-        if (command.isBlank() || command.length() > 4000) throw new IllegalArgumentException("命令为空或过长");
+        if (command.trim().isEmpty() || command.length() > 4000) throw new IllegalArgumentException("命令为空或过长");
         Process process = new ProcessBuilder("/system/bin/sh", "-c", command).directory(workspace).redirectErrorStream(true).start();
         StringBuilder output = new StringBuilder();
         Thread reader = new Thread(() -> {
@@ -212,36 +219,21 @@ public final class MobileTools {
     }
 
     private String startJob(String command) throws Exception {
-        if (command.isBlank() || command.length() > 4000) throw new IllegalArgumentException("命令为空或过长");
-        int id = NEXT_JOB.getAndIncrement();
-        File log = new File(workspace, ".dsh-job-" + id + ".log");
-        Process process = new ProcessBuilder("/system/bin/sh", "-c", command).directory(workspace)
-                .redirectErrorStream(true).redirectOutput(ProcessBuilder.Redirect.appendTo(log)).start();
-        JOBS.put(id, process);
-        return "后台任务 #" + id + " 已启动，日志=" + log.getName();
+        return store.jobs().start(command);
     }
 
-    private String listJobs() {
-        if (JOBS.isEmpty()) return "没有后台任务";
-        StringBuilder out = new StringBuilder();
-        JOBS.forEach((id, process) -> out.append('#').append(id)
-                .append(process.isAlive() ? " 运行中" : " 已结束").append('\n'));
-        return out.toString().trim();
-    }
+    private String listJobs() { return store.jobs().list(); }
 
-    private String stopJob(int id) {
-        Process process = JOBS.get(id);
-        if (process == null) return "任务不存在";
-        process.destroy();
-        return "已停止后台任务 #" + id;
-    }
+    private String stopJob(int id) { return store.jobs().stop(id); }
 
     private String fetch(String rawUrl) throws Exception {
+        if (++webRequests > store.maxWebRequests())
+            throw new IllegalStateException("本轮网页访问超过设置上限 " + store.maxWebRequests());
         URI uri = URI.create(rawUrl);
         if (!"https".equalsIgnoreCase(uri.getScheme())) throw new SecurityException("只允许 HTTPS URL");
         HttpURLConnection connection = (HttpURLConnection) uri.toURL().openConnection();
         connection.setConnectTimeout(15_000); connection.setReadTimeout(25_000);
-        connection.setRequestProperty("User-Agent", "DSH-Android/1.1");
+        connection.setRequestProperty("User-Agent", "DSH-Android/0.1.9");
         int status = connection.getResponseCode();
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(
                 status >= 400 ? connection.getErrorStream() : connection.getInputStream(), StandardCharsets.UTF_8))) {
@@ -273,17 +265,64 @@ public final class MobileTools {
 
     private String listPlugins() {
         StringBuilder value = new StringBuilder();
-        for (PluginCatalog.Entry entry : PluginCatalog.all()) value.append(
-                PluginCatalog.enabled(store.settings(), entry.id()) ? "[已启用] " : "[已停用] ")
-                .append(entry.id()).append(" · ").append(entry.kind()).append('\n');
+        for (PluginCatalog.Entry entry : PluginCatalog.all()) {
+            String status = entry.availability() == PluginCatalog.Availability.COMPATIBILITY_ONLY
+                    ? "[仅兼容标识] "
+                    : (PluginCatalog.enabled(store.settings(), entry.id()) ? "[原生已启用] " : "[原生已停用] ");
+            value.append(status).append(entry.id()).append(" · ").append(entry.kind()).append('\n');
+        }
         return value.toString().trim();
+    }
+
+    private String runCodeMode(String rawSteps) throws Exception {
+        JSONArray steps = new JSONArray(rawSteps);
+        if (steps.length() == 0 || steps.length() > 8) throw new IllegalArgumentException("Code Mode 需要 1–8 个步骤");
+        JSONArray results = new JSONArray();
+        for (int i = 0; i < steps.length(); i++) {
+            JSONObject step = steps.getJSONObject(i);
+            String toolName = step.getString("tool");
+            if ("run_code_mode".equals(toolName) || "delegate_task".equals(toolName)
+                    || "ask_user".equals(toolName)) throw new SecurityException("Code Mode 不允许嵌套 " + toolName);
+            if (!isToolAvailable(toolName)) throw new SecurityException("当前预设或插件未提供工具：" + toolName);
+            JSONObject arguments = step.optJSONObject("args");
+            if (arguments == null) arguments = new JSONObject();
+            String result = execute(toolName, arguments);
+            results.put(new JSONObject().put("step", i + 1).put("tool", toolName).put("result", result));
+        }
+        return results.toString(2);
+    }
+
+    private boolean isToolAvailable(String name) throws Exception {
+        JSONArray available = definitions(store, session);
+        for (int i = 0; i < available.length(); i++) {
+            if (name.equals(available.getJSONObject(i).getJSONObject("function").optString("name"))) return true;
+        }
+        return false;
+    }
+
+    private String createAgentPreset(JSONObject args) {
+        String base = args.optString("base", "standard");
+        String name = args.optString("name", "").trim();
+        if (name.isEmpty()) throw new IllegalArgumentException("预设名称不能为空");
+        if (!("standard".equals(base) || "code".equals(base) || "minimal".equals(base) || "cordis".equals(base)))
+            throw new IllegalArgumentException("base 必须是 standard、code、minimal 或 cordis");
+        store.addCustomPreset(name, args.optString("description"), base);
+        return "已创建自定义预设：" + name + "（" + base + "）";
     }
 
     private static void add(JSONArray tools, AppStore store, AppStore.Session session, String plugin, JSONObject definition) {
         if (store == null || session == null) { tools.put(definition); return; }
-        boolean minimal = "minimal".equals(store.preset(session.presetId).baseId());
-        if (minimal && !("tool-bash".equals(plugin) || "tool-str-replace-editor".equals(plugin))) return;
+        if (!shouldInclude(store.preset(session.presetId).baseId(), plugin)) return;
         if (PluginCatalog.enabled(store.settings(), plugin)) tools.put(definition);
+    }
+
+    static boolean shouldInclude(String baseId, String plugin) {
+        if ("minimal".equals(baseId))
+            return "tool-bash".equals(plugin) || "tool-str-replace-editor".equals(plugin);
+        if ("code-runtime".equals(plugin)) return "code".equals(baseId);
+        if ("plugin-inventory".equals(plugin) || "settings".equals(plugin) || "agent-presets".equals(plugin))
+            return "cordis".equals(baseId);
+        return true;
     }
 
     private static JSONObject prop(String name, String type, String description) throws Exception {

@@ -29,7 +29,7 @@ public final class AgentRuntime {
     public static final class UserAnswer {
         private final CountDownLatch latch = new CountDownLatch(1);
         private volatile String value = "用户取消了回答。";
-        public void resolve(String answer) { value = answer == null || answer.isBlank() ? "用户取消了回答。" : answer; latch.countDown(); }
+        public void resolve(String answer) { value = answer == null || answer.trim().isEmpty() ? "用户取消了回答。" : answer; latch.countDown(); }
         String await() throws InterruptedException { latch.await(); return value; }
     }
 
@@ -46,8 +46,14 @@ public final class AgentRuntime {
 
     public void run(AppStore.Session session, String prompt, Callback callback) {
         cancelled.set(false);
-        store.addMessage(session, new AppStore.Message("user", prompt));
-        callback.onMessage(session.messages.get(session.messages.size() - 1));
+        try {
+            store.addMessage(session, new AppStore.Message("user", prompt));
+            callback.onMessage(session.messages.get(session.messages.size() - 1));
+        } catch (Exception error) {
+            callback.onError(safeMessage(error));
+            callback.onFinished();
+            return;
+        }
         executor.execute(() -> execute(session, callback));
     }
 
@@ -70,32 +76,39 @@ public final class AgentRuntime {
                 ModelClient.Completion completion = modelClient.complete(provider, store.baseUrl(), store.model(),
                         key, conversation, definitions);
                 conversation.put(completion.canonicalMessage);
-                if (!completion.content.isBlank()) {
+                if (!completion.content.trim().isEmpty() || !completion.toolCalls.isEmpty()) {
                     AppStore.Message message = new AppStore.Message("assistant", completion.content);
+                    message.canonicalJson = completion.canonicalMessage.toString();
                     store.addMessage(session, message);
-                    callback.onMessage(message);
+                    if (!completion.content.trim().isEmpty()) callback.onMessage(message);
                 }
                 if (completion.toolCalls.isEmpty()) break;
-                for (ModelClient.ToolCall call : completion.toolCalls) {
+                int allowedCalls = store.maxToolCallsPerTurn();
+                for (int callIndex = 0; callIndex < completion.toolCalls.size(); callIndex++) {
+                    ModelClient.ToolCall call = completion.toolCalls.get(callIndex);
                     if (cancelled.get()) break;
                     callback.onStatus("工具：" + call.name);
-                    boolean approved = approveIfNeeded(call, callback);
                     String result;
-                    if (!approved) {
-                        result = "用户拒绝了此工具调用。";
+                    if (callIndex >= allowedCalls) {
+                        result = "本轮工具调用超过设置上限（" + allowedCalls + "），未执行。";
                     } else {
-                        try {
-                            if ("delegate_task".equals(call.name)) result = delegate(provider, key, call.arguments);
-                            else if ("ask_user".equals(call.name)) result = askUser(call.arguments, callback);
-                            else result = tools.execute(call.name, call.arguments);
+                        boolean approved = approveIfNeeded(call, callback);
+                        if (!approved) {
+                            result = "用户拒绝了此工具调用。";
+                        } else {
+                            try {
+                                if ("delegate_task".equals(call.name)) result = delegate(provider, key, call.arguments);
+                                else if ("ask_user".equals(call.name)) result = askUser(call.arguments, callback);
+                                else result = tools.execute(call.name, call.arguments);
+                            }
+                            catch (Exception error) { result = "工具执行失败: " + safeMessage(error); }
                         }
-                        catch (Exception error) { result = "工具执行失败: " + safeMessage(error); }
                     }
                     JSONObject toolMessage = new JSONObject().put("role", "tool").put("toolCallId", call.id)
                             .put("toolName", call.name).put("content", result);
                     conversation.put(toolMessage);
-                    AppStore.Message stored = new AppStore.Message("tool", result, call.name,
-                            System.currentTimeMillis());
+                    AppStore.Message stored = new AppStore.Message("tool", result, call.name, call.id,
+                            "", System.currentTimeMillis());
                     store.addMessage(session, stored);
                     callback.onMessage(stored);
                 }
@@ -134,7 +147,7 @@ public final class AgentRuntime {
                         arguments.optString("task") + "\n\n背景：" + arguments.optString("context")));
         ModelClient.Completion completion = modelClient.complete(provider, store.baseUrl(), store.model(),
                 key, conversation, new JSONArray());
-        return completion.content.isBlank() ? "子 Agent 未返回文本" : completion.content;
+        return completion.content.trim().isEmpty() ? "子 Agent 未返回文本" : completion.content;
     }
 
     private String askUser(JSONObject arguments, Callback callback) throws InterruptedException {
@@ -153,14 +166,22 @@ public final class AgentRuntime {
                         + "不要声称执行了未实际调用的工具。当前工作区根目录对你表示为 .。\n"
                         + store.agentInstructions()));
         for (AppStore.Message message : session.messages) {
-            if ("tool".equals(message.role)) continue; // Historical tool IDs are request-scoped.
-            result.put(new JSONObject().put("role", message.role).put("content", message.content));
+            if ("assistant".equals(message.role) && message.canonicalJson != null
+                    && !message.canonicalJson.trim().isEmpty()) {
+                result.put(new JSONObject(message.canonicalJson));
+            } else if ("tool".equals(message.role) && message.toolCallId != null
+                    && !message.toolCallId.trim().isEmpty()) {
+                result.put(new JSONObject().put("role", "tool").put("toolCallId", message.toolCallId)
+                        .put("toolName", message.toolName).put("content", message.content));
+            } else if (!"tool".equals(message.role)) {
+                result.put(new JSONObject().put("role", message.role).put("content", message.content));
+            }
         }
         return result;
     }
 
     private static String safeMessage(Throwable error) {
         String value = error.getMessage();
-        return value == null || value.isBlank() ? error.getClass().getSimpleName() : value;
+        return value == null || value.trim().isEmpty() ? error.getClass().getSimpleName() : value;
     }
 }
