@@ -1,0 +1,98 @@
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+  min-height: 100%;
+  overscroll-behavior: none;
+}
+
+body[data-dsh-android] {
+  -webkit-tap-highlight-color: transparent;
+  -webkit-text-size-adjust: 100%;
+  touch-action: manipulation;
+}
+
+body[data-dsh-android] input,
+body[data-dsh-android] textarea,
+body[data-dsh-android] select {
+  font-size: 16px !important;
+}
+
+@media (max-width: 600px) {
+  body[data-dsh-android] [role="dialog"][class*="_panel"] {
+    width: calc(100vw - 16px) !important;
+    height: calc(100vh - 16px) !important;
+    max-width: none !important;
+    max-height: none !important;
+    flex-direction: column !important;
+    border-radius: 18px !important;
+  }
+
+  body[data-dsh-android] [role="dialog"] [class*="_nav"] {
+    width: 100% !important;
+    min-width: 0 !important;
+    height: auto !important;
+    flex-direction: row !important;
+    align-items: center !important;
+    gap: 8px !important;
+    padding: 12px 10px 4px !important;
+    overflow-x: auto !important;
+    box-sizing: border-box !important;
+  }
+
+  body[data-dsh-android] [role="dialog"] [class*="_navTitle"] {
+    display: none !important;
+  }
+
+  body[data-dsh-android] [role="dialog"] [class*="_navList"] {
+    flex: 1 !important;
+    min-width: max-content !important;
+    flex-direction: row !important;
+    gap: 4px !important;
+  }
+
+  body[data-dsh-android] [role="dialog"] [class*="_navCell"] {
+    flex: none !important;
+    width: auto !important;
+    min-width: 44px !important;
+    padding: 8px 12px !important;
+  }
+
+  body[data-dsh-android] [role="dialog"] [class*="_header"] {
+    height: 46px !important;
+    padding: 9px 10px 6px !important;
+  }
+
+  body[data-dsh-android] [role="dialog"] [class*="_options"] {
+    padding: 0 14px 18px !important;
+  }
+
+  body[data-dsh-android] [class*="_handle"] {
+    display: none !important;
+  }
+
+  body[data-dsh-android] [class*="_row"] {
+    gap: 6px !important;
+  }
+
+  body[data-dsh-android] [class*="_tools"],
+  body[data-dsh-android] [class*="_modes"],
+  body[data-dsh-android] [class*="_trailing"] {
+    gap: 6px !important;
+  }
+
+  body[data-dsh-android] [class*="_select"] {
+    max-width: 120px !important;
+  }
+
+  body[data-dsh-android] [role="dialog"] {
+    max-width: calc(100vw - 16px) !important;
+    max-height: calc(100vh - 16px) !important;
+  }
+
+  body[data-dsh-android] pre,
+  body[data-dsh-android] code {
+    overflow-wrap: anywhere;
+  }
+}
