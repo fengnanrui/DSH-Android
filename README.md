@@ -1,96 +1,51 @@
 # DSH Android
 
-An unofficial Android client for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness), designed from the host lifecycle and security ideas in [DSH Desktop](https://github.com/dataelement/dsh-desktop).
+DSH Android 是参考 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 与 [DSH Desktop](https://github.com/dataelement/dsh-desktop) 交互方式重新实现的**原生、独立手机 Agent**。它不是网页套壳，不含 WebView，不连接电脑端 Harness，安装 APK 后即可在手机上使用。
 
-中文说明见下方。DSH Android is an independent community project and is not affiliated with DeepSeek AI or DataElement.
+本项目是独立社区项目，与 DeepSeek AI、DataElement 无隶属或背书关系。
 
-## What it does
+## 原生功能
 
-DSH Android connects a phone to a real Harness Web server over USB forwarding, a trusted LAN, or HTTPS. It keeps the complete Harness backend on the machine where Node.js, shells, project files, plugins, credentials, and sessions actually live, while providing an Android-native mobile shell for:
+- 原生 Android 会话、聊天、附件、工作区、计划、目标、后台 Jobs 与可重复 Agent 工作流；
+- DeepSeek、OpenAI、Anthropic、Gemini、xAI、Moonshot、MiniMax、智谱、Mistral、OpenRouter、Groq、Together 及自定义提供方管理，可切换 OpenAI / Anthropic / Gemini 协议；
+- 与上游当前主组合对齐的 136 个稳定插件 ID 清单、搜索、分类、启停状态，以及终端、Agent 循环和网页搜索配置；
+- 标准、PTC、极简、创造四套内置 Agent 预设，以及基于任一能力组创建或复制自定义预设；
+- 本机 Agent 多轮工具循环，最多 8 个工具回合，可停止；
+- 工作区目录/读取/写入/精确替换/全文与文件搜索、Android shell、后台 Jobs、HTTPS 获取、时间、计划、目标、工作流、技能、配置清单、用户提问和轻量子 Agent 工具；
+- 写文件、shell 和网络访问的原生审批弹窗及三档权限模式；
+- `.dsh/skills/<name>/SKILL.md` 本地技能；
+- Android 系统文件选择器导入附件，不申请通用存储权限；
+- API Key 由不可导出的 Android Keystore AES-GCM 密钥加密，应用禁用系统备份；
+- 本地 JSON 会话与运行中心持久化、无密钥配置导出、消息排队、浅色/深色/跟随系统外观，以及 `/new`、`/plan`、`/settings`、`/stop`、`/help` 命令；
+- Android 9 / API 28 及以上。
 
-- persistent server configuration and connection recovery;
-- the full Harness Web UI, WebSocket connection, sessions, settings, models, plugins, tools, plans, subagents, jobs, and workspaces;
-- Android file upload and multi-file selection;
-- authenticated downloads to the system Downloads folder;
-- camera, microphone, and location permission mediation for same-origin pages;
-- HTTP Basic authentication, strict TLS failure handling, and external-link isolation;
-- back navigation, reload, fullscreen content, cache controls, and a phone-sized settings layout;
-- Android 9 / API 28 compatibility.
+上游的 Node.js、Electron、`node-pty` 和浏览器前端没有被塞进 APK；相应能力用 Android/Java 原生代码重新实现，适配了手机的生命周期、沙箱、密钥和审批模型。
 
-The app intentionally does **not** pretend to run Harness locally. Current Harness requires Node.js 22+ and desktop-native modules such as `node-pty`; upstream currently validates desktop platforms, not Android/Bionic. Keeping the runtime on the host preserves the real tool environment and avoids an unreliable partial port.
+## 使用
 
-## Quick start over USB
+1. 安装并打开 APK。
+2. 在“设置 → 模型”中选择或添加提供方，点击卡片编辑 HTTPS 地址、模型与 API Key。
+3. 回到“会话”，直接给手机上的 Agent 发消息。
+4. 导入和生成的文件在“工作区”查看；计划、目标、Jobs 与工作流在“任务”页管理。
 
-Requirements:
+默认只对当前应用私有工作区执行工具。高风险工具每次询问；切换自动批准模式前请理解模型提示注入和命令执行风险。
 
-- a host running Node.js 22 or newer;
-- Android Platform Tools (`adb`);
-- an Android 9 or newer phone with USB debugging enabled.
-
-Start Harness on the host:
-
-```bash
-npx @deepseek-ai/dsh web --host 127.0.0.1 --port 3080
-```
-
-Forward the phone's loopback port and install the debug APK:
+## 构建与测试
 
 ```bash
-adb reverse tcp:3080 tcp:3080
-./gradlew installDebug
-```
-
-Open DSH Android. Its default address is `http://127.0.0.1:3080/`.
-
-If DSH Desktop selected a random loopback port, forward the fixed phone port to it instead:
-
-```bash
-adb reverse tcp:3080 tcp:62048
-```
-
-Replace `62048` with the active Harness port.
-
-## LAN and HTTPS
-
-For LAN use, configure Harness or a reverse proxy so the phone can reach it, then enter that URL in the app. Plain HTTP to a non-loopback host triggers a warning because session data and API interactions are unencrypted. HTTPS is recommended outside USB forwarding.
-
-DSH Android never ignores invalid TLS certificates. Cross-origin HTTP(S) links open in the system browser instead of inheriting the Harness WebView session.
-
-## Build
-
-```bash
+export ANDROID_HOME="$HOME/Library/Android/sdk"
 ./gradlew testDebugUnitTest lintDebug assembleDebug
+./gradlew connectedDebugAndroidTest
 ```
 
-The APK is written to `app/build/outputs/apk/debug/app-debug.apk`.
+APK 位于 `app/build/outputs/apk/debug/app-debug.apk`。项目使用 compile/target SDK 35、min SDK 28、Java 17、AGP 8.6.1 和 Gradle 8.9。
 
-Project defaults:
+验收清单见 [docs/TESTING.md](docs/TESTING.md)，真机记录见 [docs/DEVICE_VALIDATION.md](docs/DEVICE_VALIDATION.md)。
 
-- compile SDK 35;
-- target SDK 35;
-- minimum SDK 28;
-- Java 17;
-- Android Gradle Plugin 8.6.1;
-- Gradle 8.9.
+## English summary
 
-See [docs/TESTING.md](docs/TESTING.md) for the regression checklist and [docs/DEVICE_VALIDATION.md](docs/DEVICE_VALIDATION.md) for the Android 9 real-device evidence.
-
-## 中文说明
-
-DSH Android 是一个非官方的 DeepSeek Harness 手机客户端。它不在手机里伪装运行不受上游支持的 Node/PTY 环境，而是通过 USB 端口转发、可信局域网或 HTTPS 连接真实 Harness 服务。这样模型配置、凭据、插件、会话、工作区、终端和工具都继续使用 Harness 的原生实现，手机只负责安全连接和移动界面。
-
-已经适配的手机能力包括：地址保存和重试、窄屏设置页、WebSocket、上传/多选文件、下载、网页摄像头/麦克风/定位授权、返回键、全屏、HTTP Basic Auth、严格证书校验和外链隔离。最低支持 Android 9。
-
-USB 使用方法：
-
-```bash
-npx @deepseek-ai/dsh web --host 127.0.0.1 --port 3080
-adb reverse tcp:3080 tcp:3080
-./gradlew installDebug
-```
-
-然后打开应用，使用默认地址 `http://127.0.0.1:3080/` 即可。
+DSH Android is a native, standalone Android agent inspired by the interaction model of DeepSeek Harness and DSH Desktop. It contains no WebView and requires no desktop or remote Harness service. Sessions, workspaces, approvals, plans, skills, direct model-provider calls, encrypted credentials and the agent tool loop run in the Android application itself.
 
 ## License and upstream rules
 
-DSH Android is released under the [MIT License](LICENSE). Upstream attribution and trademark clarification are recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). No upstream API key, user credential, proprietary asset, or generated session is committed to this repository.
+本项目采用 [MIT License](LICENSE)。上游署名、商标说明及未复制代码的边界记录在 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。仓库不得提交 API Key、用户会话、私有工作区或设备标识。
