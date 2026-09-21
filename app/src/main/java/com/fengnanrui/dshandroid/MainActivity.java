@@ -9,8 +9,8 @@ import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Bundle;
-import android.os.Handler;
-import android.os.Looper;
+import android.os.Build;
+import android.text.TextUtils;
 import android.text.InputType;
 import android.text.Editable;
 import android.text.TextWatcher;
@@ -39,12 +39,11 @@ import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.text.DateFormat;
 import java.util.Date;
-import java.util.ArrayDeque;
 import java.util.List;
 import java.util.Locale;
 
 /** Native, standalone phone UI. Deliberately contains no WebView. */
-public final class MainActivity extends Activity {
+public final class MainActivity extends Activity implements SessionController.Listener {
     private static final int PICK_ATTACHMENT = 41;
     private static final int BLUE = Color.rgb(52, 91, 255);
     private int INK;
@@ -56,7 +55,8 @@ public final class MainActivity extends Activity {
 
     private AppStore store;
     private SecretStore secrets;
-    private AgentRuntime runtime;
+    private SessionController controller;
+    private AlertDialog runtimeDialog;
     private AppStore.Session activeSession;
     private LinearLayout root;
     private LinearLayout header;
@@ -68,10 +68,6 @@ public final class MainActivity extends Activity {
     private TextView chatStatus;
     private Button sendButton;
     private String pendingAttachment = "";
-    private boolean agentRunning;
-    private final ArrayDeque<String> promptQueue = new ArrayDeque<>();
-    private final Handler pluginSearchHandler = new Handler(Looper.getMainLooper());
-    private Runnable pendingPluginSearch;
 
     @Override protected void onCreate(Bundle state) {
         String requestedTheme = getSharedPreferences("dsh_settings", MODE_PRIVATE).getString("theme", "system");
@@ -84,16 +80,20 @@ public final class MainActivity extends Activity {
         Window window = getWindow();
         window.setStatusBarColor(CARD);
         window.setNavigationBarColor(CARD);
-        window.getDecorView().setSystemUiVisibility(darkMode ? 0 : View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR);
+        window.getDecorView().setSystemUiVisibility(darkMode ? 0
+                : View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
         window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
-        store = new AppStore(this);
-        secrets = new SecretStore(this);
-        runtime = new AgentRuntime(store, secrets);
+        controller = (SessionController) getLastNonConfigurationInstance();
+        if (controller == null) controller = new SessionController(new AppStore(getApplicationContext()),
+                new SecretStore(getApplicationContext()));
+        store = controller.store;
+        secrets = controller.secrets;
         String restoredSession = state == null ? "" : state.getString("active_session", "");
         activeSession = findSession(restoredSession);
         pendingAttachment = state == null ? "" : state.getString("pending_attachment", "");
         buildShell();
         restoreScreen(state == null ? "sessions" : state.getString("screen", "sessions"));
+        controller.attach(this);
         if (!store.persistenceWarning().trim().isEmpty()) {
             Toast.makeText(this, store.persistenceWarning(), Toast.LENGTH_LONG).show();
         }
@@ -108,11 +108,13 @@ public final class MainActivity extends Activity {
     }
 
     @Override protected void onDestroy() {
-        pluginSearchHandler.removeCallbacksAndMessages(null);
-        runtime.close();
-        store.jobs().close();
+        if (runtimeDialog != null) runtimeDialog.dismiss();
+        controller.detach();
+        if (!isChangingConfigurations()) controller.close();
         super.onDestroy();
     }
+
+    @Override public Object onRetainNonConfigurationInstance() { return controller; }
 
     @Override protected void onSaveInstanceState(Bundle state) {
         state.putString("screen", screen);
@@ -145,6 +147,11 @@ public final class MainActivity extends Activity {
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(SURFACE);
         setContentView(root);
+        if (Build.VERSION.SDK_INT >= 30) {
+            windowInsets();
+        } else {
+            root.setFitsSystemWindows(true);
+        }
 
         header = new LinearLayout(this);
         header.setGravity(Gravity.CENTER_VERTICAL);
@@ -169,10 +176,18 @@ public final class MainActivity extends Activity {
         addNav("工作区", "workspace", this::showWorkspace);
         addNav("任务", "tasks", this::showTasks);
         addNav("设置", "settings", this::showSettings);
-        // NexusAI and some Android 9 gesture overlays draw above the system navigation inset.
-        View gestureSafeArea = new View(this);
-        gestureSafeArea.setBackgroundColor(CARD);
-        root.addView(gestureSafeArea, new LinearLayout.LayoutParams(-1, dp(30)));
+        root.requestApplyInsets();
+    }
+
+    @android.annotation.TargetApi(30)
+    private void windowInsets() {
+        getWindow().setDecorFitsSystemWindows(false);
+        root.setOnApplyWindowInsetsListener((view, insets) -> {
+            android.graphics.Insets safe = insets.getInsets(android.view.WindowInsets.Type.systemBars()
+                    | android.view.WindowInsets.Type.displayCutout() | android.view.WindowInsets.Type.ime());
+            view.setPadding(safe.left, safe.top, safe.right, safe.bottom);
+            return insets;
+        });
     }
 
     private void addNav(String label, String id, Runnable action) {
@@ -190,23 +205,25 @@ public final class MainActivity extends Activity {
         for (int i = 0; i < bottomBar.getChildCount(); i++) {
             TextView item = (TextView) bottomBar.getChildAt(i);
             boolean active = id.equals(item.getTag()) || ("chat".equals(id) && "sessions".equals(item.getTag()));
-            item.setTextColor(active ? BLUE : MUTED);
+            item.setTextColor(active ? accentText() : MUTED);
             item.setTypeface(null, active ? Typeface.BOLD : Typeface.NORMAL);
-            item.setBackground(active ? round(Color.rgb(236, 240, 255), 12) : null);
+            item.setBackground(active ? round(accentSurface(), 12) : null);
         }
     }
 
     private void setHeader(String title, String action, View.OnClickListener listener) {
         header.removeAllViews();
         TextView titleView = text(title, 21, INK, true);
+        titleView.setSingleLine(true);
+        titleView.setEllipsize(TextUtils.TruncateAt.END);
         header.addView(titleView, new LinearLayout.LayoutParams(0, -2, 1));
         if (action != null) {
-            TextView button = text(action, 15, BLUE, true);
+            TextView button = text(action, 15, accentText(), true);
             button.setGravity(Gravity.CENTER);
             button.setPadding(dp(12), dp(8), dp(12), dp(8));
-            button.setBackground(round(Color.rgb(237, 241, 255), 12));
+            button.setBackground(round(accentSurface(), 12));
             button.setOnClickListener(listener);
-            header.addView(button, new LinearLayout.LayoutParams(-2, dp(40)));
+            header.addView(button, new LinearLayout.LayoutParams(-2, dp(48)));
         }
     }
 
@@ -270,7 +287,8 @@ public final class MainActivity extends Activity {
 
         chatStatus = text(providerSummary(), 12, MUTED, false);
         chatStatus.setPadding(dp(14), dp(5), dp(14), dp(3));
-        page.addView(chatStatus, new LinearLayout.LayoutParams(-1, dp(28)));
+        chatStatus.setMaxLines(3);
+        page.addView(chatStatus, new LinearLayout.LayoutParams(-1, -2));
 
         LinearLayout composer = new LinearLayout(this);
         composer.setGravity(Gravity.BOTTOM);
@@ -291,11 +309,20 @@ public final class MainActivity extends Activity {
         chatInput.setRawInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
         chatInput.setOnEditorActionListener((view, actionId, event) -> {
             if (actionId != EditorInfo.IME_ACTION_SEND) return false;
-            if (agentRunning && "newline".equals(store.enterBehavior())) return false;
+            if (controller.running() && "newline".equals(store.enterBehavior())) return false;
             send(); return true;
         });
         chatInput.setPadding(dp(14), dp(10), dp(14), dp(10));
-        chatInput.setBackground(round(Color.rgb(241, 243, 247), 18));
+        chatInput.setBackground(round(SURFACE, 18));
+        chatInput.setText(controller.drafts.getOrDefault(activeSession.id, ""));
+        final String draftSession = activeSession.id;
+        chatInput.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+            @Override public void onTextChanged(CharSequence s, int start, int before, int count) {
+                controller.drafts.put(draftSession, s.toString());
+            }
+            @Override public void afterTextChanged(Editable s) {}
+        });
         LinearLayout.LayoutParams inputParams = new LinearLayout.LayoutParams(0, -2, 1);
         inputParams.leftMargin = dp(6); inputParams.rightMargin = dp(7);
         composer.addView(chatInput, inputParams);
@@ -306,6 +333,7 @@ public final class MainActivity extends Activity {
         composer.addView(sendButton, new LinearLayout.LayoutParams(dp(66), dp(48)));
         page.addView(composer, new LinearLayout.LayoutParams(-1, -2));
         content.addView(page, matchParent());
+        updateRunState();
         messagesScroll.post(() -> messagesScroll.fullScroll(View.FOCUS_DOWN));
     }
 
@@ -315,12 +343,12 @@ public final class MainActivity extends Activity {
             LinearLayout welcome = column(dp(8));
             welcome.setPadding(dp(18), dp(18), dp(18), dp(18));
             welcome.setBackground(round(CARD, 18));
-            welcome.addView(text("手机上的完整 Agent", 20, INK, true), matchWrap());
+            welcome.addView(text("手机上的本机 Agent", 20, INK, true), matchWrap());
             welcome.addView(text("可以让它读取或修改本地工作区、搜索文件、执行经你批准的命令、访问网页并维护任务计划。", 14, MUTED, false), matchWrap());
             messagesColumn.addView(welcome, matchWrap());
             return;
         }
-        for (AppStore.Message message : activeSession.messages) addMessageBubble(message);
+        for (AppStore.Message message : store.messages(activeSession)) addMessageBubble(message);
     }
 
     private void addMessageBubble(AppStore.Message message) {
@@ -346,48 +374,15 @@ public final class MainActivity extends Activity {
         if (!pendingAttachment.trim().isEmpty()) prompt = (prompt.trim().isEmpty() ? "请查看这个附件" : prompt)
                 + "\n\n[附件已导入工作区: " + pendingAttachment + "]";
         if (prompt.trim().isEmpty()) return;
-        if (agentRunning) {
-            promptQueue.add(prompt); chatInput.setText("");
-            chatStatus.setText("已排队 " + promptQueue.size() + " 条消息"); return;
-        }
         if (prompt.startsWith("/") && handleLocalCommand(prompt)) return;
         chatInput.setText("");
         pendingAttachment = "";
-        setRunning(true);
-        runtime.run(activeSession, prompt, new AgentRuntime.Callback() {
-            @Override public void onStatus(String status) { runOnUiThread(() -> chatStatus.setText(status)); }
-            @Override public void onMessage(AppStore.Message message) { runOnUiThread(() -> {
-                addMessageBubble(message);
-                setHeader(activeSession.title, "会话列表", v -> showSessions());
-            }); }
-            @Override public void onApproval(String tool, String arguments, AgentRuntime.ApprovalDecision decision) {
-                runOnUiThread(() -> new AlertDialog.Builder(MainActivity.this)
-                        .setTitle("允许工具：" + tool + "？")
-                        .setMessage(arguments + "\n\n此操作将在手机应用沙箱中执行。")
-                        .setCancelable(false)
-                        .setNegativeButton("拒绝", (d, w) -> decision.resolve(false))
-                        .setPositiveButton("允许一次", (d, w) -> decision.resolve(true)).show());
-            }
-            @Override public void onQuestion(String question, AgentRuntime.UserAnswer answer) {
-                runOnUiThread(() -> {
-                    EditText input = multiline("请输入回答", "", 3);
-                    new AlertDialog.Builder(MainActivity.this).setTitle("Agent 需要你的回答").setMessage(question)
-                            .setView(input).setCancelable(false)
-                            .setNegativeButton("取消", (d, w) -> answer.resolve(""))
-                            .setPositiveButton("回答", (d, w) -> answer.resolve(input.getText().toString())).show();
-                });
-            }
-            @Override public void onFinished() { runOnUiThread(() -> setRunning(false)); }
-            @Override public void onError(String message) { runOnUiThread(() -> {
-                Toast.makeText(MainActivity.this, message, Toast.LENGTH_LONG).show();
-                chatStatus.setText("出错：" + message);
-            }); }
-        });
+        controller.submit(activeSession, prompt);
     }
 
     private boolean handleLocalCommand(String command) {
         if ("/settings".equals(command)) { showSettings(); return true; }
-        if ("/stop".equals(command)) { runtime.cancel(); return true; }
+        if ("/stop".equals(command)) { controller.cancel(); chatInput.setText(""); return true; }
         if ("/new".equals(command) || "/clear".equals(command)) {
             activeSession = store.createSession(); showChat(); return true;
         }
@@ -406,16 +401,39 @@ public final class MainActivity extends Activity {
         return false;
     }
 
-    private void setRunning(boolean running) {
-        if (sendButton == null) return;
-        agentRunning = running;
-        sendButton.setText(running ? "停止" : "发送");
-        sendButton.setOnClickListener(running ? v -> runtime.cancel() : v -> send());
-        chatInput.setEnabled(true);
-        if (!running && !promptQueue.isEmpty()) {
-            String next = promptQueue.removeFirst();
-            chatInput.post(() -> { chatInput.setText(next); send(); });
+    private void updateRunState() {
+        if (!"chat".equals(screen) || sendButton == null) return;
+        boolean runningHere = controller.running(activeSession);
+        sendButton.setText(runningHere ? "停止" : controller.running() ? "排队" : "发送");
+        sendButton.setOnClickListener(runningHere ? v -> controller.cancel() : v -> send());
+        chatStatus.setText(controller.status(activeSession, providerSummary()));
+    }
+
+    @Override public void changed(String sessionId, boolean messagesChanged) {
+        if (!controller.running() && runtimeDialog != null) { runtimeDialog.dismiss(); runtimeDialog = null; }
+        if (!"chat".equals(screen)) return;
+        if (activeSession.id.equals(sessionId) && messagesChanged) {
+            renderMessages(); setHeader(activeSession.title, "会话列表", v -> showSessions());
         }
+        updateRunState();
+    }
+
+    @Override public void approval(String tool, String arguments, AgentRuntime.ApprovalDecision decision) {
+        runtimeDialog = new AlertDialog.Builder(this).setTitle("允许工具：" + tool + "？")
+                .setMessage(arguments + "\n\n此操作将在手机应用沙箱中执行。")
+                .setCancelable(false)
+                .setNegativeButton("拒绝", (d, w) -> controller.resolve(decision, false))
+                .setNeutralButton("停止任务", (d, w) -> controller.cancel())
+                .setPositiveButton("允许一次", (d, w) -> controller.resolve(decision, true)).show();
+    }
+
+    @Override public void question(String question, AgentRuntime.UserAnswer answer) {
+        EditText input = multiline("请输入回答", "", 3);
+        runtimeDialog = new AlertDialog.Builder(this).setTitle("Agent 需要你的回答").setMessage(question)
+                .setView(input).setCancelable(false)
+                .setNegativeButton("取消", (d, w) -> controller.resolve(answer, ""))
+                .setNeutralButton("停止任务", (d, w) -> controller.cancel())
+                .setPositiveButton("回答", (d, w) -> controller.resolve(answer, input.getText().toString())).show();
     }
 
     private void showWorkspace() {
@@ -587,10 +605,10 @@ public final class MainActivity extends Activity {
     }
 
     private void addSettingsTab(LinearLayout tabs, String title, String id, String active, Runnable action) {
-        TextView tab = text(title, 14, id.equals(active) ? BLUE : MUTED, id.equals(active));
+        TextView tab = text(title, 14, id.equals(active) ? accentText() : MUTED, id.equals(active));
         tab.setGravity(Gravity.CENTER);
         tab.setPadding(dp(16), 0, dp(16), 0);
-        tab.setBackground(id.equals(active) ? round(Color.rgb(236, 240, 255), 13) : null);
+        tab.setBackground(id.equals(active) ? round(accentSurface(), 13) : null);
         tab.setOnClickListener(v -> action.run());
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-2, dp(40));
         params.rightMargin = dp(5); tabs.addView(tab, params);
@@ -660,7 +678,7 @@ public final class MainActivity extends Activity {
             card.setBackground(round(CARD, 15));
             LinearLayout top = new LinearLayout(this); top.setGravity(Gravity.CENTER_VERTICAL);
             TextView name = text(profile.name() + (profile.id().equals(active.id()) ? "  ●" : ""), 17,
-                    profile.id().equals(active.id()) ? BLUE : INK, true);
+                    profile.id().equals(active.id()) ? accentText() : INK, true);
             top.addView(name, new LinearLayout.LayoutParams(0, -2, 1));
             Button use = smallButton(profile.id().equals(active.id()) ? "当前" : "使用");
             use.setEnabled(!profile.id().equals(active.id()));
@@ -692,7 +710,7 @@ public final class MainActivity extends Activity {
             LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, dp(50)); params.topMargin = dp(7); form.addView(view, params);
         }
         AlertDialog.Builder builder = new AlertDialog.Builder(this).setTitle(existing == null ? "添加自定义提供方" : "编辑提供方")
-                .setView(form).setNegativeButton("取消", null).setPositiveButton("保存", null);
+                .setView(scrollableForm(form)).setNegativeButton("取消", null).setPositiveButton("保存", null);
         if (existing != null) builder.setNeutralButton(existing.builtIn() ? "清除密钥" : "删除提供方", null);
         AlertDialog dialog = builder.create();
         dialog.setOnShowListener(ignored -> {
@@ -727,10 +745,10 @@ public final class MainActivity extends Activity {
     private void showPluginsSettings() { showPluginConfiguration(); }
 
     private LinearLayout pluginHeader(String active) {
-        LinearLayout form = settingsPage("plugins", "插件", "配置并查看本地部署的上游兼容模块。");
+        LinearLayout form = settingsPage("plugins", "插件", "配置原生插件；兼容标识不代表已有可执行实现。");
         LinearLayout tabs = new LinearLayout(this);
         Button config = secondaryButton("插件配置"); Button list = secondaryButton("插件列表");
-        config.setTextColor("config".equals(active) ? BLUE : MUTED); list.setTextColor("list".equals(active) ? BLUE : MUTED);
+        config.setTextColor("config".equals(active) ? accentText() : MUTED); list.setTextColor("list".equals(active) ? accentText() : MUTED);
         config.setOnClickListener(v -> showPluginConfiguration()); list.setOnClickListener(v -> showPluginList("", false));
         tabs.addView(config, new LinearLayout.LayoutParams(0, dp(44), 1));
         LinearLayout.LayoutParams listParams = new LinearLayout.LayoutParams(0, dp(44), 1); listParams.leftMargin = dp(7);
@@ -788,18 +806,11 @@ public final class MainActivity extends Activity {
         TextView count = text("原生可用 " + PluginCatalog.nativeCount() + " · 上游兼容标识 "
                 + (PluginCatalog.all().size() - PluginCatalog.nativeCount()), 15, INK, true);
         count.setPadding(0, dp(12), 0, dp(4)); form.addView(count, matchWrap());
-        String needle = query.toLowerCase(Locale.ROOT).trim();
-        boolean includeCompatibility = showCompatibility || !needle.isEmpty();
-        if (needle.isEmpty()) {
-            Button compatibility = secondaryButton(showCompatibility ? "收起兼容标识" : "显示全部兼容标识");
-            compatibility.setOnClickListener(v -> showPluginList("", !showCompatibility));
-            LinearLayout.LayoutParams buttonParams = new LinearLayout.LayoutParams(-1, dp(44));
-            buttonParams.topMargin = dp(6); form.addView(compatibility, buttonParams);
-        }
+        final boolean[] expanded = {showCompatibility};
+        Button compatibility = secondaryButton(showCompatibility ? "收起兼容标识" : "显示全部兼容标识");
+        form.addView(compatibility, new LinearLayout.LayoutParams(-1, dp(48)));
+        java.util.Map<View, PluginCatalog.Entry> rows = new java.util.LinkedHashMap<>();
         for (PluginCatalog.Entry entry : PluginCatalog.all()) {
-            if (!includeCompatibility && entry.availability() != PluginCatalog.Availability.NATIVE) continue;
-            if (!needle.isEmpty() && !entry.id().toLowerCase(Locale.ROOT).contains(needle)
-                    && !entry.moduleName().toLowerCase(Locale.ROOT).contains(needle)) continue;
             LinearLayout row = new LinearLayout(this); row.setGravity(Gravity.CENTER_VERTICAL);
             row.setPadding(dp(13), dp(8), dp(8), dp(8)); row.setBackground(round(CARD, 13));
             TextView details = text(entry.id() + "\n" + entry.kind().name().toLowerCase(Locale.ROOT), 14, INK, true);
@@ -815,20 +826,36 @@ public final class MainActivity extends Activity {
                 row.addView(badge, new LinearLayout.LayoutParams(-2, -2));
             }
             LinearLayout.LayoutParams params = matchWrap(); params.topMargin = dp(7); form.addView(row, params);
+            rows.put(row, entry);
         }
+        TextView empty = text("没有匹配的插件", 15, MUTED, false); form.addView(empty, matchWrap());
+        Runnable filter = () -> {
+            String needle = search.getText().toString().toLowerCase(Locale.ROOT).trim();
+            int shown = 0;
+            for (java.util.Map.Entry<View, PluginCatalog.Entry> row : rows.entrySet()) {
+                PluginCatalog.Entry entry = row.getValue();
+                boolean match = (expanded[0] || !needle.isEmpty() || entry.availability() == PluginCatalog.Availability.NATIVE)
+                        && (needle.isEmpty() || entry.id().toLowerCase(Locale.ROOT).contains(needle)
+                        || entry.moduleName().toLowerCase(Locale.ROOT).contains(needle));
+                row.getKey().setVisibility(match ? View.VISIBLE : View.GONE);
+                if (match) shown++;
+            }
+            empty.setVisibility(shown == 0 ? View.VISIBLE : View.GONE);
+            compatibility.setVisibility(needle.isEmpty() ? View.VISIBLE : View.GONE);
+        };
+        compatibility.setOnClickListener(v -> {
+            expanded[0] = !expanded[0];
+            compatibility.setText(expanded[0] ? "收起兼容标识" : "显示全部兼容标识");
+            filter.run();
+        });
         search.addTextChangedListener(new TextWatcher() {
             @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
             @Override public void onTextChanged(CharSequence s, int start, int before, int count) {}
             @Override public void afterTextChanged(Editable s) {
-                String next = s.toString();
-                if (!next.equals(query)) {
-                    if (pendingPluginSearch != null) pluginSearchHandler.removeCallbacks(pendingPluginSearch);
-                    pendingPluginSearch = () -> showPluginList(next, showCompatibility);
-                    pluginSearchHandler.postDelayed(pendingPluginSearch, 180);
-                }
+                filter.run();
             }
         });
-        search.requestFocus(); search.setSelection(search.length());
+        filter.run();
     }
 
     private void showPresetsSettings() {
@@ -837,7 +864,7 @@ public final class MainActivity extends Activity {
             LinearLayout card = column(0); card.setPadding(dp(16), dp(14), dp(16), dp(14)); card.setBackground(round(CARD, 15));
             boolean current = preset.id().equals(store.defaultPresetId());
             card.addView(text(preset.name() + (preset.builtIn() ? "  内置" : "  自定义") + (current ? "  · 当前" : ""),
-                    17, current ? BLUE : INK, true), matchWrap());
+                    17, current ? accentText() : INK, true), matchWrap());
             card.addView(text(preset.description() + "\n" + preset.id(), 13, MUTED, false), matchWrap());
             LinearLayout actions = new LinearLayout(this);
             Button use = smallButton(current ? "当前使用" : "设为默认"); use.setEnabled(!current);
@@ -861,7 +888,7 @@ public final class MainActivity extends Activity {
         form.addView(name, new LinearLayout.LayoutParams(-1, dp(50)));
         LinearLayout.LayoutParams desc = new LinearLayout.LayoutParams(-1, dp(96)); desc.topMargin = dp(8); form.addView(description, desc);
         LinearLayout.LayoutParams baseParams = new LinearLayout.LayoutParams(-1, dp(52)); baseParams.topMargin = dp(8); form.addView(base, baseParams);
-        new AlertDialog.Builder(this).setTitle("创建自定义预设").setView(form).setNegativeButton("取消", null)
+        new AlertDialog.Builder(this).setTitle("创建自定义预设").setView(scrollableForm(form)).setNegativeButton("取消", null)
                 .setPositiveButton("创建", (d, w) -> {
                     String baseId = new String[]{"standard", "code", "minimal", "cordis"}[base.getSelectedItemPosition()];
                     if (!name.getText().toString().trim().isEmpty()) store.addCustomPreset(name.getText().toString().trim(), description.getText().toString().trim(), baseId);
@@ -963,7 +990,7 @@ public final class MainActivity extends Activity {
         EditText name = field("工作流名称", "", false); EditText prompt = multiline("给 Agent 的完整执行指令", "", 4);
         form.addView(name, new LinearLayout.LayoutParams(-1, dp(50)));
         LinearLayout.LayoutParams promptParams = new LinearLayout.LayoutParams(-1, dp(116)); promptParams.topMargin = dp(8); form.addView(prompt, promptParams);
-        new AlertDialog.Builder(this).setTitle("创建工作流").setView(form).setNegativeButton("取消", null)
+        new AlertDialog.Builder(this).setTitle("创建工作流").setView(scrollableForm(form)).setNegativeButton("取消", null)
                 .setPositiveButton("保存", (d, w) -> {
                     String title = name.getText().toString().trim(); String task = prompt.getText().toString().trim();
                     if (!title.isEmpty() && !task.isEmpty()) store.addWorkflow(activeSession, title, task); showWorkflows();
@@ -973,7 +1000,12 @@ public final class MainActivity extends Activity {
     private void confirmDelete(AppStore.Session session) {
         new AlertDialog.Builder(this).setTitle("删除会话？").setMessage(session.title)
                 .setNegativeButton("取消", null).setPositiveButton("删除", (d, w) -> {
+                    if (controller.pending(session)) {
+                        Toast.makeText(this, "请先停止运行或排队中的任务再删除。", Toast.LENGTH_LONG).show();
+                        return;
+                    }
                     store.deleteSession(session.id);
+                    controller.drafts.remove(session.id);
                     activeSession = store.sessions().isEmpty() ? store.createSession() : store.sessions().get(0);
                     showSessions();
                 }).show();
@@ -1019,7 +1051,7 @@ public final class MainActivity extends Activity {
 
     private void showOneNumberDialog(String title, EditText field, Runnable save) {
         LinearLayout form = column(0); form.setPadding(dp(18), 0, dp(18), 0); form.addView(field, new LinearLayout.LayoutParams(-1, dp(52)));
-        new AlertDialog.Builder(this).setTitle(title).setView(form).setNegativeButton("取消", null)
+        new AlertDialog.Builder(this).setTitle(title).setView(scrollableForm(form)).setNegativeButton("取消", null)
                 .setPositiveButton("保存", (d, w) -> { save.run(); showPluginConfiguration(); }).show();
     }
 
@@ -1027,7 +1059,7 @@ public final class MainActivity extends Activity {
         LinearLayout form = column(0); form.setPadding(dp(18), 0, dp(18), 0);
         form.addView(first, new LinearLayout.LayoutParams(-1, dp(52)));
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, dp(52)); params.topMargin = dp(8); form.addView(second, params);
-        new AlertDialog.Builder(this).setTitle(title).setView(form).setNegativeButton("取消", null)
+        new AlertDialog.Builder(this).setTitle(title).setView(scrollableForm(form)).setNegativeButton("取消", null)
                 .setPositiveButton("保存", (d, w) -> { save.run(); showPluginConfiguration(); }).show();
     }
 
@@ -1037,7 +1069,7 @@ public final class MainActivity extends Activity {
             LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, dp(52));
             params.topMargin = dp(8); form.addView(field, params);
         }
-        new AlertDialog.Builder(this).setTitle(title).setView(form).setNegativeButton("取消", null)
+        new AlertDialog.Builder(this).setTitle(title).setView(scrollableForm(form)).setNegativeButton("取消", null)
                 .setPositiveButton("保存", (d, w) -> { save.run(); showPluginConfiguration(); }).show();
     }
 
@@ -1069,10 +1101,19 @@ public final class MainActivity extends Activity {
 
     private Button smallButton(String value) {
         Button button = new Button(this);
-        button.setText(value); button.setTextSize(14); button.setTextColor(BLUE);
+        button.setText(value); button.setTextSize(14); button.setTextColor(accentText());
         button.setAllCaps(false); button.setPadding(0, 0, 0, 0);
-        button.setBackground(round(Color.rgb(238, 241, 249), 15));
+        button.setBackground(round(accentSurface(), 15));
         return button;
+    }
+
+    private int accentSurface() { return darkMode ? Color.rgb(35, 44, 70) : Color.rgb(236, 240, 255); }
+    private int accentText() { return darkMode ? Color.rgb(164, 184, 255) : BLUE; }
+
+    private ScrollView scrollableForm(View form) {
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(form, new ScrollView.LayoutParams(-1, -2));
+        return scroll;
     }
 
     private TextView text(String value, float size, int color, boolean bold) {

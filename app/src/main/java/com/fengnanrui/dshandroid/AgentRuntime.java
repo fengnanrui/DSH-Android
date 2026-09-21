@@ -35,21 +35,36 @@ public final class AgentRuntime {
 
     private final AppStore store;
     private final SecretStore secrets;
-    private final ModelClient modelClient = new ModelClient();
+    private final ModelTransport modelClient;
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final AtomicBoolean cancelled = new AtomicBoolean();
+    private final AtomicBoolean running = new AtomicBoolean();
+    private volatile Thread worker;
+    private volatile MobileTools activeTools;
+    private boolean closed;
 
     public AgentRuntime(AppStore store, SecretStore secrets) {
-        this.store = store;
-        this.secrets = secrets;
+        this(store, secrets, new ModelClient());
     }
 
-    public void run(AppStore.Session session, String prompt, Callback callback) {
+    AgentRuntime(AppStore store, SecretStore secrets, ModelTransport modelClient) {
+        this.store = store;
+        this.secrets = secrets;
+        this.modelClient = modelClient;
+    }
+
+    public synchronized void run(AppStore.Session session, String prompt, Callback callback) {
+        if (closed) { callback.onError("运行时已关闭"); callback.onFinished(); return; }
+        if (!running.compareAndSet(false, true)) {
+            callback.onError("已有任务运行，请等待完成或停止后再发送。");
+            return;
+        }
         cancelled.set(false);
         try {
             store.addMessage(session, new AppStore.Message("user", prompt));
             callback.onMessage(session.messages.get(session.messages.size() - 1));
         } catch (Exception error) {
+            running.set(false);
             callback.onError(safeMessage(error));
             callback.onFinished();
             return;
@@ -57,11 +72,22 @@ public final class AgentRuntime {
         executor.execute(() -> execute(session, callback));
     }
 
-    public void cancel() { cancelled.set(true); modelClient.cancel(); }
-    public void close() { cancel(); executor.shutdownNow(); }
+    public synchronized void cancel() {
+        cancelled.set(true);
+        Thread current = worker;
+        if (current != null) current.interrupt();
+        modelClient.cancel();
+        MobileTools tools = activeTools;
+        if (tools != null) tools.cancel();
+    }
+    public synchronized void close() { closed = true; cancel(); executor.shutdownNow(); }
 
     private void execute(AppStore.Session session, Callback callback) {
         try {
+            synchronized (this) {
+                worker = Thread.currentThread();
+                if (cancelled.get()) throw new InterruptedException();
+            }
             requirePlugin("agent");
             requirePlugin("agent-loop");
             requirePlugin("llm");
@@ -71,10 +97,13 @@ public final class AgentRuntime {
             JSONArray conversation = conversation(session);
             JSONArray definitions = MobileTools.definitions(store, session);
             MobileTools tools = new MobileTools(store.workspace(), store, session);
+            activeTools = tools;
+            boolean completed = false;
             for (int turn = 0; turn < 8 && !cancelled.get(); turn++) {
                 callback.onStatus(turn == 0 ? "正在请求 " + provider.name() : "Agent 正在继续处理…");
-                ModelClient.Completion completion = modelClient.complete(provider, store.baseUrl(), store.model(),
+                ModelClient.Completion completion = modelClient.complete(provider, profile.baseUrl(), profile.model(),
                         key, conversation, definitions);
+                if (cancelled.get() || Thread.currentThread().isInterrupted()) throw new InterruptedException();
                 conversation.put(completion.canonicalMessage);
                 if (!completion.content.trim().isEmpty() || !completion.toolCalls.isEmpty()) {
                     AppStore.Message message = new AppStore.Message("assistant", completion.content);
@@ -82,14 +111,16 @@ public final class AgentRuntime {
                     store.addMessage(session, message);
                     if (!completion.content.trim().isEmpty()) callback.onMessage(message);
                 }
-                if (completion.toolCalls.isEmpty()) break;
+                if (completion.toolCalls.isEmpty()) { completed = true; break; }
                 int allowedCalls = store.maxToolCallsPerTurn();
                 for (int callIndex = 0; callIndex < completion.toolCalls.size(); callIndex++) {
                     ModelClient.ToolCall call = completion.toolCalls.get(callIndex);
                     if (cancelled.get()) break;
                     callback.onStatus("工具：" + call.name);
                     String result;
-                    if (callIndex >= allowedCalls) {
+                    if (!MobileTools.isToolAvailable(definitions, call.name)) {
+                        result = "当前会话未开放该工具，未执行。";
+                    } else if (callIndex >= allowedCalls) {
                         result = "本轮工具调用超过设置上限（" + allowedCalls + "），未执行。";
                     } else {
                         boolean approved = approveIfNeeded(call, callback);
@@ -97,7 +128,7 @@ public final class AgentRuntime {
                             result = "用户拒绝了此工具调用。";
                         } else {
                             try {
-                                if ("delegate_task".equals(call.name)) result = delegate(provider, key, call.arguments);
+                                if ("delegate_task".equals(call.name)) result = delegate(profile, key, call.arguments);
                                 else if ("ask_user".equals(call.name)) result = askUser(call.arguments, callback);
                                 else result = tools.execute(call.name, call.arguments);
                             }
@@ -114,11 +145,13 @@ public final class AgentRuntime {
                 }
             }
             if (cancelled.get()) callback.onStatus("已停止");
-            else callback.onStatus("已完成");
+            else callback.onStatus(completed ? "已完成" : "达到本轮执行上限，可发送消息继续");
         } catch (Exception error) {
             if (cancelled.get()) callback.onStatus("已停止");
             else callback.onError(safeMessage(error));
         } finally {
+            synchronized (this) { worker = null; activeTools = null; running.set(false); }
+            Thread.interrupted();
             callback.onFinished();
         }
     }
@@ -139,13 +172,13 @@ public final class AgentRuntime {
         return decision.await();
     }
 
-    private String delegate(ProviderRegistry.Provider provider, String key, JSONObject arguments) throws Exception {
+    private String delegate(AppStore.ProviderProfile profile, String key, JSONObject arguments) throws Exception {
         JSONArray conversation = new JSONArray()
                 .put(new JSONObject().put("role", "system").put("content",
                         "你是由主 Agent 启动的手机端子 Agent。只分析指定子任务，返回可核验、简洁的结果；不要假装使用工具。"))
                 .put(new JSONObject().put("role", "user").put("content",
                         arguments.optString("task") + "\n\n背景：" + arguments.optString("context")));
-        ModelClient.Completion completion = modelClient.complete(provider, store.baseUrl(), store.model(),
+        ModelClient.Completion completion = modelClient.complete(profile.runtimeProvider(), profile.baseUrl(), profile.model(),
                 key, conversation, new JSONArray());
         return completion.content.trim().isEmpty() ? "子 Agent 未返回文本" : completion.content;
     }
@@ -165,18 +198,8 @@ public final class AgentRuntime {
                         + "复杂任务先用 update_plan 建立步骤，输出适合手机阅读的简洁中文。"
                         + "不要声称执行了未实际调用的工具。当前工作区根目录对你表示为 .。\n"
                         + store.agentInstructions()));
-        for (AppStore.Message message : session.messages) {
-            if ("assistant".equals(message.role) && message.canonicalJson != null
-                    && !message.canonicalJson.trim().isEmpty()) {
-                result.put(new JSONObject(message.canonicalJson));
-            } else if ("tool".equals(message.role) && message.toolCallId != null
-                    && !message.toolCallId.trim().isEmpty()) {
-                result.put(new JSONObject().put("role", "tool").put("toolCallId", message.toolCallId)
-                        .put("toolName", message.toolName).put("content", message.content));
-            } else if (!"tool".equals(message.role)) {
-                result.put(new JSONObject().put("role", message.role).put("content", message.content));
-            }
-        }
+        JSONArray history = ConversationHistory.replay(store.messages(session));
+        for (int i = 0; i < history.length(); i++) result.put(history.getJSONObject(i));
         return result;
     }
 

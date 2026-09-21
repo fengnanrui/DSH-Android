@@ -16,6 +16,29 @@ import java.util.HashSet;
 public final class MobileToolsTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
+    @Test public void recursiveSearchSkipsOutsideLinksAndCycles() throws Exception {
+        File workspace = temporary.newFolder("safe");
+        File outside = temporary.newFolder("outside");
+        java.nio.file.Files.write(new File(outside, "private.txt").toPath(), "secret".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        java.nio.file.Files.createSymbolicLink(new File(workspace, "outside-link").toPath(), outside.toPath());
+        java.nio.file.Files.createSymbolicLink(new File(workspace, "loop").toPath(), workspace.toPath());
+        MobileTools tools = new MobileTools(workspace, null, null);
+        assertFalse(tools.execute("search_files", new JSONObject().put("query", "secret")).contains("private"));
+        assertFalse(tools.execute("glob_files", new JSONObject().put("pattern", "*")).contains("private"));
+    }
+
+    @Test public void cancelledToolsCannotPerformWrites() throws Exception {
+        File workspace = temporary.newFolder("cancelled");
+        MobileTools tools = new MobileTools(workspace, null, null);
+        tools.cancel();
+        try {
+            tools.execute("write_file", new JSONObject().put("path", "never.txt").put("content", "no"));
+            fail("Cancelled tools must not execute");
+        } catch (InterruptedException expected) {
+            assertFalse(new File(workspace, "never.txt").exists());
+        }
+    }
+
     @Test public void blocksPathTraversal() throws Exception {
         File workspace = temporary.newFolder("workspace");
         MobileTools tools = new MobileTools(workspace, null, null);

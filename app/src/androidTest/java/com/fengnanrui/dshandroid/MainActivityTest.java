@@ -1,10 +1,12 @@
 package com.fengnanrui.dshandroid;
 
 import android.test.ActivityInstrumentationTestCase2;
+import android.app.Instrumentation.ActivityMonitor;
 import android.view.View;
 import android.view.ViewGroup;
 import android.webkit.WebView;
 import android.widget.TextView;
+import android.widget.EditText;
 
 @SuppressWarnings("deprecation")
 public final class MainActivityTest extends ActivityInstrumentationTestCase2<MainActivity> {
@@ -52,6 +54,43 @@ public final class MainActivityTest extends ActivityInstrumentationTestCase2<Mai
         assertTrue(containsText(activity.findViewById(android.R.id.content), "启动 Job"));
         clickText(activity, "工作流");
         assertTrue(containsText(activity.findViewById(android.R.id.content), "创建工作流"));
+    }
+
+    public void testActivityRecreationRetainsControllerAndChatDraft() {
+        MainActivity activity = getActivity();
+        clickText(activity, "＋ 新会话");
+        EditText editor = findEditor(activity.findViewById(android.R.id.content));
+        assertNotNull(editor);
+        getInstrumentation().runOnMainSync(() -> editor.setText("retained draft fixture"));
+        Object owner = activity.onRetainNonConfigurationInstance();
+        ActivityMonitor monitor = new ActivityMonitor(MainActivity.class.getName(), null, false);
+        getInstrumentation().addMonitor(monitor);
+        MainActivity recreated = null;
+        try {
+            getInstrumentation().runOnMainSync(activity::recreate);
+            recreated = (MainActivity) monitor.waitForActivityWithTimeout(3000);
+            assertNotNull("Activity must recreate", recreated);
+            getInstrumentation().waitForIdleSync();
+            assertSame(owner, recreated.onRetainNonConfigurationInstance());
+            EditText restored = findEditor(recreated.findViewById(android.R.id.content));
+            assertNotNull(restored);
+            assertEquals("retained draft fixture", restored.getText().toString());
+        } finally {
+            getInstrumentation().removeMonitor(monitor);
+            if (recreated != null) getInstrumentation().runOnMainSync(recreated::finish);
+        }
+    }
+
+    private EditText findEditor(View view) {
+        if (view instanceof EditText) return (EditText) view;
+        if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) view;
+            for (int i = 0; i < group.getChildCount(); i++) {
+                EditText found = findEditor(group.getChildAt(i));
+                if (found != null) return found;
+            }
+        }
+        return null;
     }
 
     private void clickText(MainActivity activity, String value) {

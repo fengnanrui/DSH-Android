@@ -83,9 +83,9 @@ public final class AppStore {
 
     private static final String PREFS = "dsh_settings";
     private static final List<AgentPreset> BUILT_IN_PRESETS = Arrays.asList(
-            new AgentPreset("standard", "标准模式", "完整编码 Agent：文件、Shell、搜索、Skills、计划、目标、子代理和工作流。", true, "standard"),
-            new AgentPreset("code", "PTC 模式", "标准模式全部能力，并提供 Code Mode 多步骤工具组合。", true, "code"),
-            new AgentPreset("minimal", "极简模式", "仅提供持久 Shell 与 str_replace_editor。", true, "minimal"),
+            new AgentPreset("standard", "标准模式", "本机编码 Agent：文件、Shell、搜索、Skills、计划、目标、轻量子代理和工作流。", true, "standard"),
+            new AgentPreset("code", "PTC 模式", "标准模式能力，加上最多 8 步的原生 JSON 工具组合；不是上游 TypeScript SDK。", true, "code"),
+            new AgentPreset("minimal", "极简模式", "仅提供单次 Android Shell 与 str_replace_editor。", true, "minimal"),
             new AgentPreset("cordis", "创造模式", "标准能力加运行时检查、插件实验与预设创建指导。", true, "cordis"));
 
     private final File sessionsFile;
@@ -116,6 +116,8 @@ public final class AppStore {
     }
 
     public synchronized List<Session> sessions() { return Collections.unmodifiableList(new ArrayList<>(sessions)); }
+
+    public synchronized List<Message> messages(Session session) { return new ArrayList<>(session.messages); }
 
     public synchronized Session session(String id) {
         for (Session session : sessions) if (session.id.equals(id)) return session;

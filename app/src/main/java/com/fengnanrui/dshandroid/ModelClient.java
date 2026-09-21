@@ -15,7 +15,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 /** Direct model API client; no desktop server or embedded web application is involved. */
-public final class ModelClient {
+public final class ModelClient implements ModelTransport {
     private volatile HttpURLConnection activeConnection;
     public static final class ToolCall {
         public final String id;
@@ -80,6 +80,7 @@ public final class ModelClient {
         }
         JSONObject canonical = new JSONObject().put("role", "assistant").put("content", content)
                 .put("_toolCalls", canonicalCalls);
+        if (message.has("reasoning_content")) canonical.put("reasoning_content", message.get("reasoning_content"));
         return new Completion(content, calls, canonical);
     }
 
@@ -107,7 +108,7 @@ public final class ModelClient {
             }
         }
         JSONObject canonical = new JSONObject().put("role", "assistant").put("content", content.toString())
-                .put("_toolCalls", canonicalCalls);
+                .put("_toolCalls", canonicalCalls).put("_anthropicBlocks", blocks);
         return new Completion(content.toString(), calls, canonical);
     }
 
@@ -122,6 +123,10 @@ public final class ModelClient {
         String url = join(base, "v1beta/models/" + URLEncoder.encode(model, "UTF-8")
                 + ":generateContent");
         JSONObject response = post(url, request, new String[][]{{"x-goog-api-key", key}});
+        return geminiCompletion(response);
+    }
+
+    static Completion geminiCompletion(JSONObject response) throws Exception {
         JSONArray parts = response.getJSONArray("candidates").getJSONObject(0).getJSONObject("content")
                 .getJSONArray("parts");
         StringBuilder content = new StringBuilder();
@@ -129,7 +134,7 @@ public final class ModelClient {
         JSONArray canonicalCalls = new JSONArray();
         for (int i = 0; i < parts.length(); i++) {
             JSONObject part = parts.getJSONObject(i);
-            if (part.has("text")) content.append(part.optString("text"));
+            if (part.has("text") && !part.optBoolean("thought")) content.append(part.optString("text"));
             JSONObject function = part.optJSONObject("functionCall");
             if (function != null) {
                 String id = "gemini_" + System.nanoTime() + "_" + i;
@@ -140,17 +145,18 @@ public final class ModelClient {
             }
         }
         JSONObject canonical = new JSONObject().put("role", "assistant").put("content", content.toString())
-                .put("_toolCalls", canonicalCalls);
+                .put("_toolCalls", canonicalCalls).put("_geminiParts", parts);
         return new Completion(content.toString(), calls, canonical);
     }
 
-    private static JSONArray openAiMessages(JSONArray source) throws Exception {
+    static JSONArray openAiMessages(JSONArray source) throws Exception {
         JSONArray result = new JSONArray();
         for (int i = 0; i < source.length(); i++) {
             JSONObject message = source.getJSONObject(i);
             String role = message.getString("role");
             JSONObject target = new JSONObject().put("role", role).put("content", message.optString("content", ""));
             if ("assistant".equals(role)) {
+                if (message.has("reasoning_content")) target.put("reasoning_content", message.get("reasoning_content"));
                 JSONArray canonicalCalls = message.optJSONArray("_toolCalls");
                 if (canonicalCalls != null && canonicalCalls.length() > 0) {
                     JSONArray calls = new JSONArray();
@@ -170,16 +176,26 @@ public final class ModelClient {
         return result;
     }
 
-    private static JSONArray anthropicMessages(JSONArray source) throws Exception {
+    static JSONArray anthropicMessages(JSONArray source) throws Exception {
         JSONArray result = new JSONArray();
         for (int i = 0; i < source.length(); i++) {
             JSONObject message = source.getJSONObject(i);
             String role = message.getString("role");
             if ("system".equals(role)) continue;
             if ("tool".equals(role)) {
-                result.put(new JSONObject().put("role", "user").put("content", new JSONArray().put(
-                        new JSONObject().put("type", "tool_result").put("tool_use_id", message.getString("toolCallId"))
-                                .put("content", message.optString("content")))));
+                JSONArray results;
+                if (i > 0 && "tool".equals(source.getJSONObject(i - 1).optString("role")))
+                    results = result.getJSONObject(result.length() - 1).getJSONArray("content");
+                else {
+                    results = new JSONArray();
+                    result.put(new JSONObject().put("role", "user").put("content", results));
+                }
+                results.put(new JSONObject().put("type", "tool_result").put("tool_use_id", message.getString("toolCallId"))
+                        .put("content", message.optString("content")));
+                continue;
+            }
+            if ("assistant".equals(role) && message.has("_anthropicBlocks")) {
+                result.put(new JSONObject().put("role", role).put("content", message.getJSONArray("_anthropicBlocks")));
                 continue;
             }
             JSONArray blocks = new JSONArray();
@@ -197,18 +213,26 @@ public final class ModelClient {
         return result;
     }
 
-    private static JSONArray geminiMessages(JSONArray source) throws Exception {
+    static JSONArray geminiMessages(JSONArray source) throws Exception {
         JSONArray result = new JSONArray();
         for (int i = 0; i < source.length(); i++) {
             JSONObject message = source.getJSONObject(i);
             String role = message.getString("role");
             if ("system".equals(role)) continue;
+            if ("assistant".equals(role) && message.has("_geminiParts")) {
+                result.put(new JSONObject().put("role", "model").put("parts", message.getJSONArray("_geminiParts")));
+                continue;
+            }
             JSONArray parts = new JSONArray();
             if ("tool".equals(role)) {
                 parts.put(new JSONObject().put("functionResponse", new JSONObject()
                         .put("name", message.optString("toolName")).put("response", new JSONObject()
                                 .put("result", message.optString("content")))));
                 role = "user";
+                if (i > 0 && "tool".equals(source.getJSONObject(i - 1).optString("role"))) {
+                    result.getJSONObject(result.length() - 1).getJSONArray("parts").put(parts.getJSONObject(0));
+                    continue;
+                }
             } else {
                 if (!message.optString("content").trim().isEmpty()) parts.put(new JSONObject().put("text", message.optString("content")));
                 JSONArray calls = message.optJSONArray("_toolCalls");
@@ -251,20 +275,22 @@ public final class ModelClient {
         return result.toString().trim();
     }
 
-    private static JSONObject parseArguments(String value) {
-        try { return new JSONObject(value); } catch (Exception ignored) { return new JSONObject(); }
+    static JSONObject parseArguments(String value) throws Exception {
+        return new JSONObject(value);
     }
 
     private JSONObject post(String url, JSONObject request, String[][] headers) throws Exception {
         HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
         activeConnection = connection;
+        if (Thread.currentThread().isInterrupted()) { connection.disconnect(); activeConnection = null; throw new InterruptedException(); }
         connection.setRequestMethod("POST");
+        connection.setInstanceFollowRedirects(false);
         connection.setConnectTimeout(20_000);
         connection.setReadTimeout(120_000);
         connection.setDoOutput(true);
         connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
         connection.setRequestProperty("Accept", "application/json");
-        connection.setRequestProperty("User-Agent", "DSH-Android/0.1.9");
+        connection.setRequestProperty("User-Agent", "DSH-Android/" + BuildConfig.VERSION_NAME);
         for (String[] header : headers) connection.setRequestProperty(header[0], header[1]);
         byte[] body = request.toString().getBytes(StandardCharsets.UTF_8);
         connection.setFixedLengthStreamingMode(body.length);
@@ -277,28 +303,39 @@ public final class ModelClient {
         try {
             int status = connection.getResponseCode();
             InputStream stream = status >= 400 ? connection.getErrorStream() : connection.getInputStream();
-            StringBuilder response = new StringBuilder();
-            if (stream != null) try (BufferedReader reader = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    response.append(line);
-                    if (response.length() > 2 * 1024 * 1024) throw new IllegalStateException("模型响应超过 2 MiB 限制");
-                }
+            String response = "";
+            if (stream != null) try (InputStreamReader reader = new InputStreamReader(stream, StandardCharsets.UTF_8)) {
+                response = BoundedText.read(reader, 2 * 1024 * 1024 + 1, false);
+                if (response.length() > 2 * 1024 * 1024) throw new IllegalStateException("模型响应超过 2 MiB 限制");
             }
             if (status < 200 || status >= 300) {
-                String detail = response.length() > 1000 ? response.substring(0, 1000) : response.toString();
-                throw new IllegalStateException("模型 API 返回 HTTP " + status + ": " + detail);
+                throw new IllegalStateException("模型 API 返回 HTTP " + status + ": " + errorDetail(response, headers));
             }
-            return new JSONObject(response.toString());
+            return new JSONObject(response);
         } finally {
             connection.disconnect();
             if (activeConnection == connection) activeConnection = null;
         }
     }
 
-    private static String join(String base, String path) {
-        String left = base.endsWith("/") ? base.substring(0, base.length() - 1) : base;
+    static String errorDetail(String response, String[][] headers) {
+        String detail = response;
+        // Redact before clipping: a credential crossing the display limit must not leak its prefix.
+        for (String[] header : headers) {
+            if (header[1].isEmpty()) continue;
+            detail = detail.replace(header[1], "[redacted]");
+            if (header[1].startsWith("Bearer ") && header[1].length() > 7)
+                detail = detail.replace(header[1].substring(7), "[redacted]");
+        }
+        return detail.length() > 1000 ? detail.substring(0, 1000) : detail;
+    }
+
+    static String join(String base, String path) {
+        String left = base;
+        while (left.endsWith("/")) left = left.substring(0, left.length() - 1);
         String right = path.startsWith("/") ? path.substring(1) : path;
+        int slash = right.indexOf('/');
+        if (slash > 0 && left.endsWith("/" + right.substring(0, slash))) right = right.substring(slash + 1);
         return left + "/" + right;
     }
 }

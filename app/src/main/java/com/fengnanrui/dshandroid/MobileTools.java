@@ -14,6 +14,9 @@ import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.TimeUnit;
 
 /** Sandboxed native tools exposed according to the active preset and plugin inventory. */
@@ -23,6 +26,9 @@ public final class MobileTools {
     private final AppStore store;
     private final AppStore.Session session;
     private int webRequests;
+    private volatile ManagedShell foregroundProcess;
+    private volatile HttpURLConnection activeConnection;
+    private volatile boolean cancelled;
 
     public MobileTools(File workspace, AppStore store, AppStore.Session session) {
         this.workspace = workspace; this.store = store; this.session = session;
@@ -89,6 +95,8 @@ public final class MobileTools {
     }
 
     public String execute(String name, JSONObject args) throws Exception {
+        if (cancelled || Thread.currentThread().isInterrupted()) throw new InterruptedException();
+        if (!isToolAvailable(name)) throw new SecurityException("当前预设或插件未提供工具：" + name);
         return switch (name) {
             case "list_files" -> listFiles(args.optString("path", "."));
             case "read_file" -> readFile(args.getString("path"));
@@ -113,6 +121,15 @@ public final class MobileTools {
             case "create_agent_preset" -> createAgentPreset(args);
             default -> throw new IllegalArgumentException("未知工具: " + name);
         };
+    }
+
+    /** Cancel the foreground operation without stopping separately managed background jobs. */
+    public void cancel() {
+        cancelled = true;
+        ManagedShell process = foregroundProcess;
+        if (process != null) process.close();
+        HttpURLConnection connection = activeConnection;
+        if (connection != null) connection.disconnect();
     }
 
     public File resolve(String relative) throws Exception {
@@ -167,16 +184,17 @@ public final class MobileTools {
     private String search(String query, String path) throws Exception {
         if (query.trim().isEmpty()) throw new IllegalArgumentException("搜索内容为空");
         List<String> hits = new ArrayList<>();
-        searchRecursive(resolve(path), query.toLowerCase(Locale.ROOT), hits);
+        searchRecursive(resolve(path), query.toLowerCase(Locale.ROOT), hits, new HashSet<>());
         return hits.isEmpty() ? "没有匹配结果" : String.join("\n", hits.subList(0, Math.min(100, hits.size())));
     }
 
-    private void searchRecursive(File file, String query, List<String> hits) throws Exception {
-        if (hits.size() >= 100) return;
+    private void searchRecursive(File file, String query, List<String> hits, Set<String> visited) throws Exception {
+        if (cancelled || Thread.currentThread().isInterrupted()) throw new InterruptedException();
+        if (hits.size() >= 100 || Files.isSymbolicLink(file.toPath()) || !visited.add(file.getCanonicalPath())) return;
         if (file.isDirectory()) {
             File[] children = file.listFiles();
-            if (children != null) for (File child : children) searchRecursive(child, query, hits);
-        } else if (file.length() <= MAX_FILE_BYTES) {
+            if (children != null) for (File child : children) searchRecursive(child, query, hits, visited);
+        } else if (file.isFile() && file.length() <= MAX_FILE_BYTES) {
             List<String> lines;
             try { lines = Files.readAllLines(file.toPath(), StandardCharsets.UTF_8); } catch (Exception ignored) { return; }
             for (int i = 0; i < lines.size() && hits.size() < 100; i++) if (lines.get(i).toLowerCase(Locale.ROOT).contains(query))
@@ -186,36 +204,49 @@ public final class MobileTools {
 
     private String glob(String pattern) throws Exception {
         List<String> hits = new ArrayList<>();
-        globRecursive(workspace, pattern.toLowerCase(Locale.ROOT).replace("*", ""), hits);
+        globRecursive(workspace, pattern.toLowerCase(Locale.ROOT).replace("*", ""), hits, new HashSet<>());
         return hits.isEmpty() ? "没有匹配文件" : String.join("\n", hits.subList(0, Math.min(200, hits.size())));
     }
 
-    private void globRecursive(File file, String needle, List<String> hits) throws Exception {
-        if (hits.size() >= 200) return;
+    private void globRecursive(File file, String needle, List<String> hits, Set<String> visited) throws Exception {
+        if (cancelled || Thread.currentThread().isInterrupted()) throw new InterruptedException();
+        if (hits.size() >= 200 || Files.isSymbolicLink(file.toPath()) || !visited.add(file.getCanonicalPath())) return;
         if (file.isDirectory()) {
             File[] children = file.listFiles();
-            if (children != null) for (File child : children) globRecursive(child, needle, hits);
+            if (children != null) for (File child : children) globRecursive(child, needle, hits, visited);
         } else if (needle.isEmpty() || file.getName().toLowerCase(Locale.ROOT).contains(needle))
             hits.add(workspace.toPath().relativize(file.toPath()).toString());
     }
 
     private String runShell(String command) throws Exception {
         if (command.trim().isEmpty() || command.length() > 4000) throw new IllegalArgumentException("命令为空或过长");
-        Process process = new ProcessBuilder("/system/bin/sh", "-c", command).directory(workspace).redirectErrorStream(true).start();
-        StringBuilder output = new StringBuilder();
+        ManagedShell shell = ManagedShell.start(workspace, command, store.shellTimeoutSeconds());
+        Process process = shell.process;
+        foregroundProcess = shell;
+        AtomicReference<String> output = new AtomicReference<>("");
+        AtomicReference<Exception> readError = new AtomicReference<>();
+        int limit = store.shellOutputKb() * 1024;
         Thread reader = new Thread(() -> {
-            try (BufferedReader input = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-                String line; int limit = store.shellOutputKb() * 1024;
-                while ((line = input.readLine()) != null && output.length() < limit) output.append(line).append('\n');
-            } catch (Exception ignored) {}
-        });
+            try (InputStreamReader input = new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8)) {
+                output.set(BoundedText.read(input, limit, true));
+            } catch (Exception error) { readError.set(error); }
+        }, "dsh-shell-output");
+        reader.setDaemon(true);
         reader.start();
-        if (!process.waitFor(store.shellTimeoutSeconds(), TimeUnit.SECONDS)) {
-            process.destroyForcibly(); reader.join(1000);
-            throw new IllegalStateException("命令运行超过 " + store.shellTimeoutSeconds() + " 秒，已终止");
+        try {
+            if (cancelled) throw new InterruptedException();
+            if (!process.waitFor(store.shellTimeoutSeconds(), TimeUnit.SECONDS))
+                throw new IllegalStateException("命令运行超过 " + store.shellTimeoutSeconds() + " 秒，已终止");
+            reader.join(1000);
+            if (reader.isAlive()) throw new IllegalStateException("命令已结束，但输出管道仍被子进程占用");
+            if (readError.get() != null) throw readError.get();
+            return "exit=" + process.exitValue() + "\n" + output.get().trim();
+        } finally {
+            foregroundProcess = null;
+            shell.close();
+            reader.interrupt();
+            process.getInputStream().close();
         }
-        reader.join(1000);
-        return "exit=" + process.exitValue() + "\n" + output.toString().trim();
     }
 
     private String startJob(String command) throws Exception {
@@ -232,15 +263,19 @@ public final class MobileTools {
         URI uri = URI.create(rawUrl);
         if (!"https".equalsIgnoreCase(uri.getScheme())) throw new SecurityException("只允许 HTTPS URL");
         HttpURLConnection connection = (HttpURLConnection) uri.toURL().openConnection();
+        activeConnection = connection;
         connection.setConnectTimeout(15_000); connection.setReadTimeout(25_000);
-        connection.setRequestProperty("User-Agent", "DSH-Android/0.1.9");
-        int status = connection.getResponseCode();
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(
-                status >= 400 ? connection.getErrorStream() : connection.getInputStream(), StandardCharsets.UTF_8))) {
-            StringBuilder body = new StringBuilder(); String line;
-            while ((line = reader.readLine()) != null && body.length() < MAX_FILE_BYTES) body.append(line).append('\n');
-            return "HTTP " + status + "\n" + body.toString().trim();
-        } finally { connection.disconnect(); }
+        connection.setRequestProperty("User-Agent", "DSH-Android/" + BuildConfig.VERSION_NAME);
+        connection.setInstanceFollowRedirects(false);
+        try {
+            if (cancelled) throw new InterruptedException();
+            int status = connection.getResponseCode();
+            java.io.InputStream stream = status >= 400 ? connection.getErrorStream() : connection.getInputStream();
+            if (stream == null) return "HTTP " + status;
+            try (InputStreamReader reader = new InputStreamReader(stream, StandardCharsets.UTF_8)) {
+                return "HTTP " + status + "\n" + BoundedText.read(reader, MAX_FILE_BYTES, false).trim();
+            }
+        } finally { activeConnection = null; connection.disconnect(); }
     }
 
     private String updatePlan(String step) { store.addPlan(session, step); return "已加入任务列表: " + step; }
@@ -293,7 +328,10 @@ public final class MobileTools {
     }
 
     private boolean isToolAvailable(String name) throws Exception {
-        JSONArray available = definitions(store, session);
+        return isToolAvailable(definitions(store, session), name);
+    }
+
+    static boolean isToolAvailable(JSONArray available, String name) throws Exception {
         for (int i = 0; i < available.length(); i++) {
             if (name.equals(available.getJSONObject(i).getJSONObject("function").optString("name"))) return true;
         }
