@@ -95,8 +95,7 @@ public final class MobileTools {
     }
 
     public String execute(String name, JSONObject args) throws Exception {
-        if (cancelled || Thread.currentThread().isInterrupted()) throw new InterruptedException();
-        if (!isToolAvailable(name)) throw new SecurityException("当前预设或插件未提供工具：" + name);
+        requireAvailable(name);
         return switch (name) {
             case "list_files" -> listFiles(args.optString("path", "."));
             case "read_file" -> readFile(args.getString("path"));
@@ -121,6 +120,11 @@ public final class MobileTools {
             case "create_agent_preset" -> createAgentPreset(args);
             default -> throw new IllegalArgumentException("未知工具: " + name);
         };
+    }
+
+    void requireAvailable(String name) throws Exception {
+        if (cancelled || Thread.currentThread().isInterrupted()) throw new InterruptedException();
+        if (!isToolAvailable(name)) throw new SecurityException("当前预设或插件未提供工具：" + name);
     }
 
     /** Cancel the foreground operation without stopping separately managed background jobs. */

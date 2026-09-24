@@ -81,6 +81,26 @@ public final class MainActivityTest extends ActivityInstrumentationTestCase2<Mai
         }
     }
 
+    public void testRestoredDraftAppearsWithoutLeavingTheConversation() {
+        MainActivity activity = getActivity();
+        clickText(activity, "＋ 新会话");
+        SessionController controller = (SessionController) activity.onRetainNonConfigurationInstance();
+        AppStore.Session session = controller.store.sessions().get(0);
+        EditText editor = findEditor(activity.findViewById(android.R.id.content));
+        assertNotNull(editor);
+        getInstrumentation().runOnMainSync(() -> {
+            editor.setText("new draft");
+            controller.drafts.put(session.id, "new draft\n\nunsent queued message");
+            activity.changed(session.id, false);
+        });
+        assertEquals("new draft\n\nunsent queued message", editor.getText().toString());
+        getInstrumentation().runOnMainSync(() -> {
+            editor.setSelection(2);
+            activity.changed(session.id, false);
+        });
+        assertEquals("Status updates must not move the cursor", 2, editor.getSelectionStart());
+    }
+
     private EditText findEditor(View view) {
         if (view instanceof EditText) return (EditText) view;
         if (view instanceof ViewGroup) {

@@ -4,6 +4,7 @@ import android.os.Handler;
 import android.os.Looper;
 import java.util.ArrayDeque;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.Map;
 
 /** Owns a foreground runtime across Activity recreation; UI callbacks never own the run. */
@@ -122,11 +123,15 @@ final class SessionController implements AutoCloseable {
     }
 
     private void clearQueue() {
+        LinkedHashSet<AppStore.Session> restored = new LinkedHashSet<>();
         while (!queue.isEmpty()) {
             Prompt prompt = queue.removeFirst();
-            drafts.merge(prompt.session().id, prompt.text(), (a, b) -> a + "\n\n" + b);
+            drafts.merge(prompt.session().id, prompt.text(), (a, b) -> a.isEmpty() ? b : a + "\n\n" + b);
             statuses.put(prompt.session().id, "排队已取消，未发送的内容保留为草稿");
+            restored.add(prompt.session());
         }
+        // Publish only after every pending item is removed and its draft is complete.
+        for (AppStore.Session session : restored) notifyChanged(session, false);
     }
 
     private void dispatch(Runnable action) { main.post(() -> { if (!closed) action.run(); }); }

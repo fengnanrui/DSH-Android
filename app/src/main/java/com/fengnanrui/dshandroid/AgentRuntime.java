@@ -128,6 +128,7 @@ public final class AgentRuntime {
                             result = "用户拒绝了此工具调用。";
                         } else {
                             try {
+                                tools.requireAvailable(call.name);
                                 if ("delegate_task".equals(call.name)) result = delegate(profile, key, call.arguments);
                                 else if ("ask_user".equals(call.name)) result = askUser(call.arguments, callback);
                                 else result = tools.execute(call.name, call.arguments);

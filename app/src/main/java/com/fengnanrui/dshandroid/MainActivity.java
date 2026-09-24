@@ -412,6 +412,13 @@ public final class MainActivity extends Activity implements SessionController.Li
     @Override public void changed(String sessionId, boolean messagesChanged) {
         if (!controller.running() && runtimeDialog != null) { runtimeDialog.dismiss(); runtimeDialog = null; }
         if (!"chat".equals(screen)) return;
+        if (activeSession.id.equals(sessionId) && chatInput != null) {
+            String draft = controller.drafts.getOrDefault(sessionId, "");
+            if (!draft.contentEquals(chatInput.getText())) {
+                chatInput.setText(draft);
+                chatInput.setSelection(draft.length());
+            }
+        }
         if (activeSession.id.equals(sessionId) && messagesChanged) {
             renderMessages(); setHeader(activeSession.title, "会话列表", v -> showSessions());
         }

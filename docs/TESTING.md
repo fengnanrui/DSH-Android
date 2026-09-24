@@ -30,6 +30,15 @@ ANDROID_HOME=/path/to/android-sdk ./gradlew connectedDebugAndroidTest
 
 ## Functional regression
 
+### 2026-09-25 源码回归
+
+- 修复取消/失败后排队草稿未通知当前界面的问题；恢复文本立即显示，同时保留新草稿和普通状态更新时的光标位置。两项新增回归在修复前失败，修复后通过。
+- 修复模型请求期间停用插件后，`delegate_task` / `ask_user` 仍能执行的问题。它们现在与其他原生工具共用执行前授权和取消检查。新增用例在修复前观察到多余模型请求及提问回调，修复后禁止执行。
+- 使用独立只读 API 36 模拟器；不覆盖 v0.2.0-rc.1 的既有发布附件，也不把本次构建当作真机或付费模型验收。
+- `testDebugUnitTest` 19 项、`connectedDebugAndroidTest` 20 项全部通过；`lintDebug` 与 `assembleDebug` 通过，仍保留上面注明的两个既有 lint warning。
+
+## 待完成的人工回归
+
 - [x] 无端口转发安装、冷启动并浏览四个底部页面。
 - [ ] 保存供应商、模型和 API Key；重启后配置保留且 Key 不显示明文。
 - [ ] 创建、继续、长按删除会话。
